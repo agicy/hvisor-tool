@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -164,6 +165,81 @@ static __u64 load_image_to_memory(const char *path, __u64 load_paddr) {
 
     close(fd);
     return map_size;
+}
+
+/**
+ * @brief Parse modules configuration from a JSON array.
+ *
+ * This function parses modules configuration from a JSON array. Each module
+ * configuration item should contain string fields: `name`, `filepath`, and
+ * `load_paddr`.
+ *
+ * @param modules_json The JSON array containing modules configuration.
+ * @return 0 on success, -1 on error.
+ */
+static int parse_modules(const cJSON *const modules_json) {
+    // if not configured, just info it and return success
+    if (modules_json == NULL || !cJSON_IsArray(modules_json)) {
+        log_info("No additional modules configured, skip loading.");
+        return 0;
+    }
+
+    // info total number of modules
+    size_t num_modules = SAFE_CJSON_GET_ARRAY_SIZE(modules_json);
+    log_info("Found %zu module configurations in JSON", num_modules);
+
+    // parse each module configuration item, and load them to memory
+    for (size_t i = 0; i < num_modules; i++) {
+        const cJSON *const module_json =
+            SAFE_CJSON_GET_ARRAY_ITEM(modules_json, i);
+        const cJSON *const name_json =
+            SAFE_CJSON_GET_OBJECT_ITEM(module_json, "name");
+        const cJSON *const filepath_json =
+            SAFE_CJSON_GET_OBJECT_ITEM(module_json, "filepath");
+        const cJSON *const load_paddr_json =
+            SAFE_CJSON_GET_OBJECT_ITEM(module_json, "load_paddr");
+
+        // name, filepath, load_paddr are required
+        if (name_json == NULL || !cJSON_IsString(name_json) ||
+            filepath_json == NULL || !cJSON_IsString(filepath_json) ||
+            load_paddr_json == NULL || !cJSON_IsString(load_paddr_json)) {
+            log_error(
+                "Missing required string field (name, filepath, load_paddr) "
+                "in module configuration at index %zu",
+                i);
+            return -1;
+        }
+
+        // check file accessibility
+        if (access(filepath_json->valuestring, R_OK) != 0) {
+            log_error("Cannot access module file: %s - %s",
+                      filepath_json->valuestring, strerror(errno));
+            return -1;
+        }
+
+        // load module image to memory
+        uintptr_t item_load_paddr = parse_json_address(load_paddr_json);
+        size_t item_size =
+            load_image_to_memory(filepath_json->valuestring, item_load_paddr);
+
+        // record module info
+        log_info("Loaded index %zu module '%s' (path: %s) to memory at "
+                 "0x%" PRIxPTR ", size: %zu bytes",
+                 i, name_json->valuestring, filepath_json->valuestring,
+                 item_load_paddr, item_size);
+
+        // warn if loaded size is 0
+        if (item_size == 0) {
+            log_warn("Module '%s' loaded with size 0, "
+                     "please check the file content.",
+                     name_json->valuestring);
+        }
+    }
+
+    // info total number of modules loaded
+    log_info("Total %zu modules loaded", num_modules);
+
+    return 0;
 }
 
 #define CHECK_JSON_NULL(json_ptr, json_name)                                   \
@@ -404,6 +480,7 @@ static int zone_start_from_json(const char *json_config_path,
     cJSON *entry_point_json = SAFE_CJSON_GET_OBJECT_ITEM(root, "entry_point");
     cJSON *interrupts_json = SAFE_CJSON_GET_OBJECT_ITEM(root, "interrupts");
     cJSON *ivc_configs_json = SAFE_CJSON_GET_OBJECT_ITEM(root, "ivc_configs");
+    cJSON *modules_json = SAFE_CJSON_GET_OBJECT_ITEM(root, "modules");
 
     CHECK_JSON_NULL_ERR_OUT(zone_id_json, "zone_id")
     CHECK_JSON_NULL_ERR_OUT(cpus_json, "cpus")
@@ -416,6 +493,7 @@ static int zone_start_from_json(const char *json_config_path,
     CHECK_JSON_NULL_ERR_OUT(entry_point_json, "entry_point")
     CHECK_JSON_NULL_ERR_OUT(interrupts_json, "interrupts")
     CHECK_JSON_NULL_ERR_OUT(ivc_configs_json, "ivc_configs")
+    // modules is an optional configuration, just skip it here
 
     config->zone_id = zone_id_json->valueint;
 
@@ -533,6 +611,11 @@ static int zone_start_from_json(const char *json_config_path,
 
     log_info("Kernel size: %llu, DTB size: %llu", config->kernel_size,
              config->dtb_size);
+
+    // modules configuration is optional, return -1 if failed, otherwise 0
+    if (parse_modules(modules_json)) {
+        goto err_out;
+    }
 
     // check name length
     if (strlen(name_json->valuestring) > CONFIG_NAME_MAXLEN) {
