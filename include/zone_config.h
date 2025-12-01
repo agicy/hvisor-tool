@@ -68,6 +68,8 @@ struct Gicv2Config {
     __u64 gicv_size;
 };
 
+typedef struct Gicv2Config gicv2_config_t;
+
 struct Gicv3Config {
     __u64 gicd_base;
     __u64 gicd_size;
@@ -76,6 +78,8 @@ struct Gicv3Config {
     __u64 gits_base;
     __u64 gits_size;
 };
+
+typedef struct Gicv3Config gicv3_config_t;
 
 struct Gicv2Payload {
     __u64 gic_version_tag;

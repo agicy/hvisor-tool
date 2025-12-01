@@ -96,6 +96,32 @@ int open_dev() {
     return fd;
 }
 
+/**
+ * @brief Parse a JSON string to a uintptr_t value.
+ *
+ * This function converts a JSON string to a uintptr_t value. The JSON string
+ * should represent a hexadecimal number.
+ *
+ * @param json_str The JSON string to parse.
+ * @return The parsed uintptr_t value.
+ */
+static uintptr_t parse_json_address(const cJSON *const json_str) {
+    return strtoull(json_str->valuestring, NULL, 16);
+}
+
+/**
+ * @brief Parse a JSON string to a size_t value.
+ *
+ * This function converts a JSON string to a size_t value. The JSON string
+ * should represent a hexadecimal number.
+ *
+ * @param json_str The JSON string to parse.
+ * @return The parsed size_t value.
+ */
+static size_t parse_json_size(const cJSON *const json_str) {
+    return strtoull(json_str->valuestring, NULL, 16);
+}
+
 static __u64 load_image_to_memory(const char *path, __u64 load_paddr) {
     if (strcmp(path, "null") == 0) {
         return 0;
@@ -198,46 +224,37 @@ static int parse_arch_config(cJSON *root, zone_config_t *config) {
         CHECK_JSON_NULL(gich_size_json, "gich_size")
         CHECK_JSON_NULL(gicv_base_json, "gicv_base")
         CHECK_JSON_NULL(gicv_size_json, "gicv_size")
+
+        gicv2_config_t *const gicv2_config =
+            &config->arch_config.gic_config.gicv2.gicv2_config;
         config->arch_config.gic_config.gicv2.gic_version_tag = 0;
-        config->arch_config.gic_config.gicv2.gicv2_config.gicd_base =
-            strtoull(gicd_base_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv2.gicv2_config.gicd_size =
-            strtoull(gicd_size_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv2.gicv2_config.gicc_base =
-            strtoull(gicc_base_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv2.gicv2_config.gicc_size =
-            strtoull(gicc_size_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv2.gicv2_config.gicc_offset =
-            strtoull(gicc_offset_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv2.gicv2_config.gich_base =
-            strtoull(gich_base_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv2.gicv2_config.gich_size =
-            strtoull(gich_size_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv2.gicv2_config.gicv_base =
-            strtoull(gicv_base_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv2.gicv2_config.gicv_size =
-            strtoull(gicv_size_json->valuestring, NULL, 16);
+        gicv2_config->gicd_base = parse_json_address(gicd_base_json);
+        gicv2_config->gicd_size = parse_json_size(gicd_size_json);
+        gicv2_config->gicc_base = parse_json_address(gicc_base_json);
+        gicv2_config->gicc_size = parse_json_size(gicc_size_json);
+        gicv2_config->gicc_offset = parse_json_address(gicc_offset_json);
+        gicv2_config->gich_base = parse_json_address(gich_base_json);
+        gicv2_config->gich_size = parse_json_size(gich_size_json);
+        gicv2_config->gicv_base = parse_json_address(gicv_base_json);
+        gicv2_config->gicv_size = parse_json_size(gicv_size_json);
     } else if (!strcmp(gic_version, "v3")) {
         CHECK_JSON_NULL(gicd_base_json, "gicd_base")
         CHECK_JSON_NULL(gicr_base_json, "gicr_base")
         CHECK_JSON_NULL(gicd_size_json, "gicd_size")
         CHECK_JSON_NULL(gicr_size_json, "gicr_size")
+
+        gicv3_config_t *const gicv3_config =
+            &config->arch_config.gic_config.gicv3.gicv3_config;
         config->arch_config.gic_config.gicv3.gic_version_tag = 1;
-        config->arch_config.gic_config.gicv3.gicv3_config.gicd_base =
-            strtoull(gicd_base_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv3.gicv3_config.gicd_size =
-            strtoull(gicd_size_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv3.gicv3_config.gicr_base =
-            strtoull(gicr_base_json->valuestring, NULL, 16);
-        config->arch_config.gic_config.gicv3.gicv3_config.gicr_size =
-            strtoull(gicr_size_json->valuestring, NULL, 16);
+        gicv3_config->gicd_base = parse_json_address(gicd_base_json);
+        gicv3_config->gicd_size = parse_json_size(gicd_size_json);
+        gicv3_config->gicr_base = parse_json_address(gicr_base_json);
+        gicv3_config->gicr_size = parse_json_size(gicr_size_json);
         if (gits_base_json == NULL || gits_size_json == NULL) {
             log_warn("No gits fields in arch_config.\n");
         } else {
-            config->arch_config.gic_config.gicv3.gicv3_config.gits_base =
-                strtoull(gits_base_json->valuestring, NULL, 16);
-            config->arch_config.gic_config.gicv3.gicv3_config.gits_size =
-                strtoull(gits_size_json->valuestring, NULL, 16);
+            gicv3_config->gits_base = parse_json_address(gits_base_json);
+            gicv3_config->gits_size = parse_json_size(gits_size_json);
         }
     } else {
         log_error("Invalid GIC version. It should be either of v2 or v3\n");
@@ -272,14 +289,10 @@ static int parse_arch_config(cJSON *root, zone_config_t *config) {
         return -1;
     }
 
-    config->arch_config.plic_base =
-        strtoull(plic_base_json->valuestring, NULL, 16);
-    config->arch_config.plic_size =
-        strtoull(plic_size_json->valuestring, NULL, 16);
-    config->arch_config.aplic_base =
-        strtoull(aplic_base_json->valuestring, NULL, 16);
-    config->arch_config.aplic_size =
-        strtoull(aplic_size_json->valuestring, NULL, 16);
+    config->arch_config.plic_base = parse_json_address(plic_base_json);
+    config->arch_config.plic_size = parse_json_size(plic_size_json);
+    config->arch_config.aplic_base = parse_json_address(aplic_base_json);
+    config->arch_config.aplic_size = parse_json_size(aplic_size_json);
 #endif
 
     return 0;
@@ -330,26 +343,18 @@ static int parse_pci_config(cJSON *root, zone_config_t *config) {
     CHECK_JSON_NULL(pci_mem32_base_json, "pci_mem32_base")
     CHECK_JSON_NULL(pci_mem64_base_json, "pci_mem64_base")
 
-    config->pci_config.ecam_base =
-        strtoull(ecam_base_json->valuestring, NULL, 16);
-    config->pci_config.io_base = strtoull(io_base_json->valuestring, NULL, 16);
-    config->pci_config.mem32_base =
-        strtoull(mem32_base_json->valuestring, NULL, 16);
-    config->pci_config.mem64_base =
-        strtoull(mem64_base_json->valuestring, NULL, 16);
-    config->pci_config.pci_io_base =
-        strtoull(pci_io_base_json->valuestring, NULL, 16);
-    config->pci_config.pci_mem32_base =
-        strtoull(pci_mem32_base_json->valuestring, NULL, 16);
-    config->pci_config.pci_mem64_base =
-        strtoull(pci_mem64_base_json->valuestring, NULL, 16);
-    config->pci_config.ecam_size =
-        strtoull(ecam_size_json->valuestring, NULL, 16);
-    config->pci_config.io_size = strtoull(io_size_json->valuestring, NULL, 16);
-    config->pci_config.mem32_size =
-        strtoull(mem32_size_json->valuestring, NULL, 16);
-    config->pci_config.mem64_size =
-        strtoull(mem64_size_json->valuestring, NULL, 16);
+    pci_config_t *const pci_config = &config->pci_config;
+    pci_config->ecam_base = parse_json_address(ecam_base_json);
+    pci_config->io_base = parse_json_address(io_base_json);
+    pci_config->mem32_base = parse_json_address(mem32_base_json);
+    pci_config->mem64_base = parse_json_address(mem64_base_json);
+    pci_config->pci_io_base = parse_json_address(pci_io_base_json);
+    pci_config->pci_mem32_base = parse_json_address(pci_mem32_base_json);
+    pci_config->pci_mem64_base = parse_json_address(pci_mem64_base_json);
+    pci_config->ecam_size = parse_json_size(ecam_size_json);
+    pci_config->io_size = parse_json_size(io_size_json);
+    pci_config->mem32_size = parse_json_size(mem32_size_json);
+    pci_config->mem64_size = parse_json_size(mem64_size_json);
     cJSON *alloc_pci_devs_json =
         SAFE_CJSON_GET_OBJECT_ITEM(root, "alloc_pci_devs");
     int num_pci_devs = SAFE_CJSON_GET_ARRAY_SIZE(alloc_pci_devs_json);
@@ -452,14 +457,12 @@ static int zone_start_from_json(const char *json_config_path,
             goto err_out;
         }
 
-        mem_region->physical_start = strtoull(
-            SAFE_CJSON_GET_OBJECT_ITEM(region, "physical_start")->valuestring,
-            NULL, 16);
-        mem_region->virtual_start = strtoull(
-            SAFE_CJSON_GET_OBJECT_ITEM(region, "virtual_start")->valuestring,
-            NULL, 16);
-        mem_region->size = strtoull(
-            SAFE_CJSON_GET_OBJECT_ITEM(region, "size")->valuestring, NULL, 16);
+        mem_region->physical_start = parse_json_address(
+            SAFE_CJSON_GET_OBJECT_ITEM(region, "physical_start"));
+        mem_region->virtual_start = parse_json_address(
+            SAFE_CJSON_GET_OBJECT_ITEM(region, "virtual_start"));
+        mem_region->size =
+            parse_json_size(SAFE_CJSON_GET_OBJECT_ITEM(region, "size"));
 
         log_debug("memory_region %d: type %d, physical_start %llx, "
                   "virtual_start %llx, size %llx",
@@ -489,27 +492,19 @@ static int zone_start_from_json(const char *json_config_path,
     config->num_ivc_configs = num_ivc_configs;
     for (int i = 0; i < num_ivc_configs; i++) {
         cJSON *ivc_config_json = SAFE_CJSON_GET_ARRAY_ITEM(ivc_configs_json, i);
-        ivc_config_t *ivc_config = &config->ivc_configs[i];
+        ivc_config_t *const ivc_config = &config->ivc_configs[i];
         ivc_config->ivc_id =
             SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "ivc_id")->valueint;
         ivc_config->peer_id =
             SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "peer_id")->valueint;
-        ivc_config->shared_mem_ipa = strtoull(
-            SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "shared_mem_ipa")
-                ->valuestring,
-            NULL, 16);
-        ivc_config->control_table_ipa = strtoull(
-            SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "control_table_ipa")
-                ->valuestring,
-            NULL, 16);
-        ivc_config->rw_sec_size =
-            strtoull(SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "rw_sec_size")
-                         ->valuestring,
-                     NULL, 16);
-        ivc_config->out_sec_size =
-            strtoull(SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "out_sec_size")
-                         ->valuestring,
-                     NULL, 16);
+        ivc_config->shared_mem_ipa = parse_json_address(
+            SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "shared_mem_ipa"));
+        ivc_config->control_table_ipa = parse_json_address(
+            SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "control_table_ipa"));
+        ivc_config->rw_sec_size = parse_json_size(
+            SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "rw_sec_size"));
+        ivc_config->out_sec_size = parse_json_size(
+            SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "out_sec_size"));
         ivc_config->interrupt_num =
             SAFE_CJSON_GET_OBJECT_ITEM(ivc_config_json, "interrupt_num")
                 ->valueint;
@@ -521,23 +516,20 @@ static int zone_start_from_json(const char *json_config_path,
                  ivc_config->shared_mem_ipa, ivc_config->interrupt_num,
                  ivc_config->max_peers);
     }
-    config->entry_point = strtoull(entry_point_json->valuestring, NULL, 16);
 
-    config->kernel_load_paddr =
-        strtoull(kernel_load_paddr_json->valuestring, NULL, 16);
+    config->entry_point = parse_json_address(entry_point_json);
 
-    config->dtb_load_paddr =
-        strtoull(dtb_load_paddr_json->valuestring, NULL, 16);
+    config->kernel_load_paddr = parse_json_address(kernel_load_paddr_json);
+
+    config->dtb_load_paddr = parse_json_address(dtb_load_paddr_json);
 
     // Load kernel image to memory
     config->kernel_size = load_image_to_memory(
-        kernel_filepath_json->valuestring,
-        strtoull(kernel_load_paddr_json->valuestring, NULL, 16));
+        kernel_filepath_json->valuestring, config->kernel_load_paddr);
 
     // Load dtb to memory
-    config->dtb_size = load_image_to_memory(
-        dtb_filepath_json->valuestring,
-        strtoull(dtb_load_paddr_json->valuestring, NULL, 16));
+    config->dtb_size = load_image_to_memory(dtb_filepath_json->valuestring,
+                                            config->dtb_load_paddr);
 
     log_info("Kernel size: %llu, DTB size: %llu", config->kernel_size,
              config->dtb_size);
