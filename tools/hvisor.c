@@ -98,6 +98,28 @@ int open_dev() {
 }
 
 /**
+ * @brief Parse a JSON object (int or string) to a uintmax_t value.
+ *
+ * This function converts a JSON object to a uintmax_t value. The JSON object
+ * can be either an integer or a string representing a hexadecimal number.
+ *
+ * @param json_obj The JSON object to parse.
+ * @return The parsed uintmax_t value.
+ */
+static uintmax_t parse_json_to_uintmax(const cJSON *const json_obj) {
+    if (cJSON_IsNumber(json_obj)) {
+        return (uintmax_t)json_obj->valueint;
+    }
+
+    if (cJSON_IsString(json_obj)) {
+        return strtoull(json_obj->valuestring, NULL, 16);
+    }
+
+    log_error("parse_json_to_uintmax: invalid JSON object");
+    return 0;
+}
+
+/**
  * @brief Parse a JSON string to a uintptr_t value.
  *
  * This function converts a JSON string to a uintptr_t value. The JSON string
@@ -107,7 +129,7 @@ int open_dev() {
  * @return The parsed uintptr_t value.
  */
 static uintptr_t parse_json_address(const cJSON *const json_str) {
-    return strtoull(json_str->valuestring, NULL, 16);
+    return (uintptr_t)parse_json_to_uintmax(json_str);
 }
 
 /**
@@ -120,7 +142,7 @@ static uintptr_t parse_json_address(const cJSON *const json_str) {
  * @return The parsed size_t value.
  */
 static size_t parse_json_size(const cJSON *const json_str) {
-    return strtoull(json_str->valuestring, NULL, 16);
+    return (size_t)parse_json_to_uintmax(json_str);
 }
 
 static __u64 load_str_to_memory(const char *str, __u64 load_paddr) {
@@ -746,7 +768,8 @@ static int zone_start_from_json(const char *json_config_path,
            sizeof(BitmapWord) * (CONFIG_MAX_INTERRUPTS /
                                  CONFIG_INTERRUPTS_BITMAP_BITS_PER_WORD));
     for (int i = 0; i < num_interrupts; i++) {
-        __u32 irq = SAFE_CJSON_GET_ARRAY_ITEM(interrupts_json, i)->valueint;
+        __u32 irq = (__u32)parse_json_to_uintmax(
+            SAFE_CJSON_GET_ARRAY_ITEM(interrupts_json, i));
 
         size_t word_index = irq / CONFIG_INTERRUPTS_BITMAP_BITS_PER_WORD;
         size_t bit_index = irq % CONFIG_INTERRUPTS_BITMAP_BITS_PER_WORD;
