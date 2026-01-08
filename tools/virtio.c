@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -36,6 +37,7 @@
 
 /// hvisor kernel module fd
 int ko_fd;
+int event_fd;
 volatile struct virtio_bridge *virtio_bridge;
 
 pthread_mutex_t RES_MUTEX = PTHREAD_MUTEX_INITIALIZER;
@@ -992,6 +994,7 @@ void virtio_close() {
     destroy_event_monitor();
     for (int i = 0; i < vdevs_num; i++)
         vdevs[i]->virtio_close(vdevs[i]);
+    close(event_fd);
     close(ko_fd);
     munmap((void *)virtio_bridge, MMAP_SIZE);
     for (int i = 0; i < MAX_ZONES; i++) {
@@ -1006,34 +1009,42 @@ void virtio_close() {
 }
 
 void handle_virtio_requests() {
-    int sig;
-    sigset_t wait_set;
     struct timespec timeout;
     unsigned int req_front = virtio_bridge->req_front;
     volatile struct device_req *req;
     timeout.tv_sec = 0;
     timeout.tv_nsec = WAIT_TIME;
-    sigemptyset(&wait_set);
-    sigaddset(&wait_set, SIGHVI);
-    sigaddset(&wait_set, SIGTERM);
     virtio_bridge->need_wakeup = 1;
 
-    int signal_count = 0, proc_count = 0;
+    int event_count = 0, proc_count = 0;
     unsigned long long count = 0;
+    uint64_t event_val;
+
+    // Keep using the same signal mask for SIGTERM handling
+    sigset_t wait_set;
+    sigemptyset(&wait_set);
+    sigaddset(&wait_set, SIGTERM);
+
     for (;;) {
-#ifndef LOONGARCH64
-        log_warn("signal_count is %d, proc_count is %d", signal_count,
-                 proc_count);
-        sigwait(&wait_set, &sig); // change to no signal irq
-        signal_count++;
-        if (sig == SIGTERM) {
-            virtio_close();
-            break;
-        } else if (sig != SIGHVI) {
-            log_error("unknown signal %d", sig);
+        // Use simple blocking read on eventfd
+        if (eventfd_read(event_fd, &event_val) < 0) {
+            if (errno == EINTR) {
+                // Check if SIGTERM was received
+                int sig;
+                if (sigwait(&wait_set, &sig) == 0 && sig == SIGTERM) {
+                    virtio_close();
+                    break;
+                }
+                continue;
+            }
+            log_error("eventfd_read failed: %d", errno);
             continue;
         }
-#endif
+
+        event_count++;
+        log_warn("event_count is %d, proc_count is %d", event_count,
+                 proc_count);
+
         while (1) {
             if (!is_queue_empty(req_front, virtio_bridge->req_rear)) {
                 count = 0;
@@ -1044,9 +1055,7 @@ void handle_virtio_requests() {
                 req_front = (req_front + 1) & (MAX_REQ - 1);
                 virtio_bridge->req_front = req_front;
                 write_barrier();
-            }
-#ifndef LOONGARCH64
-            else {
+            } else {
                 count++;
                 if (count < 10000000)
                     continue;
@@ -1058,7 +1067,6 @@ void handle_virtio_requests() {
                     break;
                 }
             }
-#endif
         }
     }
 }
@@ -1113,6 +1121,21 @@ int virtio_init() {
         NULL, MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, ko_fd, 0);
     if (virtio_bridge == (void *)-1) {
         log_error("mmap failed");
+        goto unmap;
+    }
+
+    // Create eventfd for wakeup mechanism
+    event_fd = eventfd(0, 0);
+    if (event_fd < 0) {
+        log_error("eventfd creation failed");
+        goto unmap;
+    }
+
+    // Set eventfd to kernel module
+    err = ioctl(ko_fd, HVISOR_SET_EVENTFD, event_fd);
+    if (err) {
+        log_error("ioctl HVISOR_SET_EVENTFD failed, err code is %d", err);
+        close(event_fd);
         goto unmap;
     }
 

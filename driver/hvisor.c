@@ -9,6 +9,7 @@
  *      Guowei Li <2401213322@stu.pku.edu.cn>
  */
 #include <asm/cacheflush.h>
+#include <linux/eventfd.h>
 #include <linux/gfp.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -33,6 +34,7 @@
 struct virtio_bridge *virtio_bridge;
 int virtio_irq = -1;
 static struct task_struct *task = NULL;
+static int event_fd = -1;
 
 // initial virtio el2 shared region
 static int hvisor_init_virtio(void) {
@@ -231,6 +233,10 @@ static long hvisor_ioctl(struct file *file, unsigned int ioctl,
     case HVISOR_CONFIG_CHECK:
         err = hvisor_config_check((u64 __user *)arg);
         break;
+    case HVISOR_SET_EVENTFD:
+        event_fd = arg;
+        pr_info("hvisor.ko: eventfd set to %d\n", event_fd);
+        break;
 #ifdef LOONGARCH64
     case HVISOR_CLEAR_INJECT_IRQ:
         err = hvisor_call(HVISOR_HC_CLEAR_INJECT_IRQ, 0, 0);
@@ -288,30 +294,42 @@ static struct miscdevice hvisor_misc_dev = {
     .fops = &hvisor_fops,
 };
 
-// Interrupt handler for Virtio device.
+/**
+ * virtio_irq_handler - Interrupt handler for Virtio device.
+ * @irq: IRQ number that triggered the interrupt.
+ * @dev_id: Pointer to the device identifier passed during irq registration.
+ *
+ * This function handles interrupts from the Virtio device. It first validates
+ * that the interrupt is intended for our device by comparing the provided
+ * dev_id with our misc device structure. If valid, it checks if eventfd is
+ * configured for user space wakeup. If eventfd is not configured or writing to
+ * it fails, appropriate error messages are logged and IRQ_NONE is returned.
+ * Otherwise, it writes to the eventfd to wake up the user space virtio daemon
+ * and returns IRQ_HANDLED.
+ *
+ * Return: IRQ_HANDLED if the interrupt was successfully handled, IRQ_NONE
+ * otherwise.
+ */
 static irqreturn_t virtio_irq_handler(int irq, void *dev_id) {
-    struct siginfo info;
     if (dev_id != &hvisor_misc_dev) {
+        /* Invalid device ID - interrupt not for our device */
+        pr_warn("hvisor: Dev_id %p not found\n", dev_id);
         return IRQ_NONE;
     }
 
-    memset(&info, 0, sizeof(struct siginfo));
-    info.si_signo = SIGHVI;
-    info.si_code = SI_QUEUE;
-    info.si_int = 1;
-    // Send signal SIGHVI to hvisor user task
-    if (task != NULL) {
-        // pr_info("send signal to hvisor device\n");
-#if (LINUX_VERSION_CODE <= KERNEL_VERSION(4, 20, 0))
-        if (send_sig_info(SIGHVI, (struct siginfo *)&info, task) < 0) {
-            pr_err("Unable to send signal\n");
-        }
-#else
-        if (send_sig_info(SIGHVI, (struct kernel_siginfo *)&info, task) < 0) {
-            pr_err("Unable to send signal\n");
-        }
-#endif
+    if (event_fd == -1) {
+        /* No eventfd configured for user space wakeup */
+        pr_warn("hvisor: No eventfd configured for virtio irq\n");
+        return IRQ_NONE;
     }
+
+    /* Write to eventfd to wake up the virtio daemon */
+    if (eventfd_write(event_fd, 1) < 0) {
+        /* Failed to write to eventfd - cannot wake up user space */
+        pr_err("hvisor: Unable to write to eventfd\n");
+        return IRQ_NONE;
+    }
+
     return IRQ_HANDLED;
 }
 
