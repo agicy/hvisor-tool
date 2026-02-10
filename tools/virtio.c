@@ -1087,7 +1087,17 @@ void initialize_log() {
     log_set_level(log_level);
 }
 
-int virtio_init() {
+/**
+ * Initialize virtio backend environment
+ *
+ * This function opens the hvisor kernel device, maps shared memory,
+ * and initializes logging and event monitoring subsystems.
+ *
+ * @param device_path Path to the hvisor device node (e.g., "/dev/hvisor0").
+ *                    If NULL, defaults to "/dev/hvisor".
+ * @return 0 on success, -1 on failure
+ */
+int virtio_init(const char *device_path) {
     // The higher log level is, the faster virtio-blk will be.
     int err;
 
@@ -1104,9 +1114,15 @@ int virtio_init() {
     initialize_log();
 
     log_info("hvisor init");
-    ko_fd = open("/dev/hvisor", O_RDWR);
+    
+    // Determine which device node to use. 
+    // This supports multi-process architecture where each daemon instance
+    // connects to a specific device node (e.g., /dev/hvisor0, /dev/hvisor1).
+    const char *path = device_path ? device_path : "/dev/hvisor";
+    
+    ko_fd = open(path, O_RDWR);
     if (ko_fd < 0) {
-        log_error("open hvisor failed");
+        log_error("open hvisor failed: %s", path);
         exit(1);
     }
     // ioctl for init virtio
@@ -1321,6 +1337,17 @@ err_out:
     return err;
 }
 
+/**
+ * Parse device path from configuration file
+ *
+ * Reads the JSON configuration file and extracts the "device_path" field.
+ * This path specifies which kernel device node (/dev/hvisorX) the daemon
+ * should connect to.
+ *
+ * @param json_path Path to the JSON configuration file
+ * @return Allocated string containing the device path, or NULL if not found/error.
+ *         Caller is responsible for freeing the returned string.
+ */
 char *virtio_get_device_path(char *json_path) {
     char *buffer = NULL;
     uint64_t file_size;
@@ -1342,9 +1369,25 @@ char *virtio_get_device_path(char *json_path) {
     return path;
 }
 
+/**
+ * Start the virtio daemon
+ *
+ * This is the main entry point for the virtio backend. It initializes the
+ * environment, parses the configuration, creates virtual devices, and
+ * enters the request handling loop.
+ *
+ * @param argc Argument count
+ * @param argv Argument vector. argv[3] is expected to be the config file path.
+ * @return 0 on success, non-zero on failure
+ */
 int virtio_start(int argc, char *argv[]) {
     int opt, err = 0;
-    err = virtio_init(); // Initialize virtio dependencies
+    
+    // Parse device path from config first to ensure we connect to the correct
+    // kernel device node before initialization.
+    char *dev_path = virtio_get_device_path(argv[3]);
+    err = virtio_init(dev_path); // Initialize virtio dependencies
+    if (dev_path) free(dev_path);
     if (err)
         return -1;
 
