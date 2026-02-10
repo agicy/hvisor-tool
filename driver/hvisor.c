@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /**
- * Copyright (c) 2025 Syswonder
- *
- * Syswonder Website:
- *      https://www.syswonder.org
- *
- * Authors:
- *      Guowei Li <2401213322@stu.pku.edu.cn>
- */
+ * Copyright (c) 2025 Syswonder
+ *
+ * Syswonder Website:
+ *      https://www.syswonder.org
+ *
+ * Authors:
+ *      Guowei Li <2401213322@stu.pku.edu.cn>
+ */
 #include <asm/cacheflush.h>
 #include <linux/gfp.h>
 #include <linux/init.h>
@@ -31,25 +31,30 @@
 #include "hvisor.h"
 #include "zone_config.h"
 
-struct virtio_bridge *virtio_bridge;
-int virtio_irq = -1;
-static struct task_struct *task = NULL;
-struct eventfd_ctx *virtio_irq_ctx = NULL;
+struct hvisor_device {
+    struct miscdevice misc_dev;
+    struct virtio_bridge *virtio_bridge;
+    int virtio_irq;
+    struct task_struct *task;
+    struct eventfd_ctx *virtio_irq_ctx;
+};
+
+static struct hvisor_device *global_hvisor_dev;
 
 // initial virtio el2 shared region
-static int hvisor_init_virtio(void) {
+static int hvisor_init_virtio(struct hvisor_device *dev) {
     int err;
-    if (virtio_irq == -1) {
+    if (dev->virtio_irq == -1) {
         pr_err("virtio device is not available\n");
         return ENOTTY;
     }
-    virtio_bridge = (struct virtio_bridge *)__get_free_pages(GFP_KERNEL, 0);
-    if (virtio_bridge == NULL)
+    dev->virtio_bridge = (struct virtio_bridge *)__get_free_pages(GFP_KERNEL, 0);
+    if (dev->virtio_bridge == NULL)
         return -ENOMEM;
-    SetPageReserved(virt_to_page(virtio_bridge));
+    SetPageReserved(virt_to_page(dev->virtio_bridge));
     // init device region
-    memset(virtio_bridge, 0, sizeof(struct virtio_bridge));
-    err = hvisor_call(HVISOR_HC_INIT_VIRTIO, __pa(virtio_bridge), 0);
+    memset(dev->virtio_bridge, 0, sizeof(struct virtio_bridge));
+    err = hvisor_call(HVISOR_HC_INIT_VIRTIO, __pa(dev->virtio_bridge), 0);
     if (err)
         return err;
     return 0;
@@ -63,56 +68,6 @@ static int hvisor_finish_req(void) {
         return err;
     return 0;
 }
-
-// static int flush_cache(__u64 phys_start, __u64 size)
-// {
-//     void __iomem *vaddr;
-//     int err = 0;
-
-//     size = PAGE_ALIGN(size);
-
-//     // 使用 ioremap 映射物理地址
-//     vaddr = ioremap_cache(phys_start, size);
-//     if (!vaddr) {
-//         pr_err("hvisor.ko: failed to ioremap image\n");
-//         return -ENOMEM;
-//     }
-
-//     // flush I-cache（ARM64 平台中 flush_icache_range 是对 D/I 的处理）
-//     flush_icache_range((unsigned long)vaddr, (unsigned long)vaddr + size);
-
-//     // 解除映射
-//     iounmap(vaddr);
-//     return err;
-// }
-// static int flush_cache(__u64 phys_start, __u64 size)
-// {
-//     struct vm_struct *vma;
-//     int err = 0;
-//     size = PAGE_ALIGN(size);
-//     vma = get_vm_area(size, VM_IOREMAP);
-//     if (!vma)
-//     {
-//         pr_err("hvisor.ko: failed to allocate virtual kernel memory for
-//         image\n"); return -ENOMEM;
-//     }
-//     vma->phys_addr = phys_start;
-
-//     if (ioremap_page_range((unsigned long)vma->addr, (unsigned
-//     long)(vma->addr + size), phys_start, PAGE_KERNEL_EXEC))
-//     {
-//         pr_err("hvisor.ko: failed to ioremap image\n");
-//         err = -EFAULT;
-//         goto unmap_vma;
-//     }
-//     // flush icache will also flush dcache
-//     flush_icache_range((unsigned long)(vma->addr), (unsigned long)(vma->addr
-//     + size));
-
-// unmap_vma:
-//     vunmap(vma->addr);
-//     return err;
-// }
 
 static int hvisor_zone_start(zone_config_t __user *arg) {
     int err = 0;
@@ -138,28 +93,6 @@ static int hvisor_zone_start(zone_config_t __user *arg) {
     kfree(zone_config);
     return err;
 }
-
-// #ifndef LOONGARCH64
-// static int is_reserved_memory(unsigned long phys, unsigned long size) {
-//     struct device_node *parent, *child;
-//     struct reserved_mem *rmem;
-//     phys_addr_t mem_base;
-//     size_t mem_size;
-//     int count = 0;
-//     parent = of_find_node_by_path("/reserved-memory");
-//     count = of_get_child_count(parent);
-
-//     for_each_child_of_node(parent, child) {
-//         rmem = of_reserved_mem_lookup(child);
-//         mem_base = rmem->base;
-//         mem_size = rmem->size;
-//         if (mem_base <= phys && (mem_base + mem_size) >= (phys + size)) {
-//             return 1;
-//         }
-//     }
-//     return 0;
-// }
-// #endif
 
 static int hvisor_config_check(u64 __user *arg) {
     int err = 0;
@@ -213,10 +146,13 @@ out:
 static long hvisor_ioctl(struct file *file, unsigned int ioctl,
                          unsigned long arg) {
     int err = 0;
+    struct miscdevice *mdev = file->private_data;
+    struct hvisor_device *dev = container_of(mdev, struct hvisor_device, misc_dev);
+
     switch (ioctl) {
     case HVISOR_INIT_VIRTIO:
-        err = hvisor_init_virtio();
-        task = get_current(); // get hvisor user process
+        err = hvisor_init_virtio(dev);
+        dev->task = get_current(); // get hvisor user process
         break;
     case HVISOR_ZONE_START:
         err = hvisor_zone_start((zone_config_t __user *)arg);
@@ -238,9 +174,9 @@ static long hvisor_ioctl(struct file *file, unsigned int ioctl,
         if (IS_ERR(ctx)) {
             err = PTR_ERR(ctx);
         } else {
-            if (virtio_irq_ctx)
-                eventfd_ctx_put(virtio_irq_ctx);
-            virtio_irq_ctx = ctx;
+            if (dev->virtio_irq_ctx)
+                eventfd_ctx_put(dev->virtio_irq_ctx);
+            dev->virtio_irq_ctx = ctx;
         }
         break;
     }
@@ -260,9 +196,12 @@ static long hvisor_ioctl(struct file *file, unsigned int ioctl,
 static int hvisor_map(struct file *filp, struct vm_area_struct *vma) {
     unsigned long phys;
     int err;
+    struct miscdevice *mdev = filp->private_data;
+    struct hvisor_device *dev = container_of(mdev, struct hvisor_device, misc_dev);
+
     if (vma->vm_pgoff == 0) {
         // virtio_bridge must be aligned to one page.
-        phys = virt_to_phys(virtio_bridge);
+        phys = virt_to_phys(dev->virtio_bridge);
         // vma->vm_flags |= (VM_IO | VM_LOCKED | (VM_DONTEXPAND | VM_DONTDUMP));
         // Not sure should we add this line.
         err = remap_pfn_range(vma, vma->vm_start, phys >> PAGE_SHIFT,
@@ -295,16 +234,12 @@ static const struct file_operations hvisor_fops = {
     .mmap = hvisor_map,
 };
 
-static struct miscdevice hvisor_misc_dev = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = "hvisor",
-    .fops = &hvisor_fops,
-};
-
 // Interrupt handler for Virtio device.
 static irqreturn_t virtio_irq_handler(int irq, void *dev_id) {
     struct siginfo info;
-    if (dev_id != &hvisor_misc_dev) {
+    struct hvisor_device *dev = (struct hvisor_device *)dev_id;
+
+    if (dev == NULL) {
         return IRQ_NONE;
     }
 
@@ -313,16 +248,16 @@ static irqreturn_t virtio_irq_handler(int irq, void *dev_id) {
     info.si_code = SI_QUEUE;
     info.si_int = 1;
     // Send signal SIGHVI to hvisor user task
-    if (virtio_irq_ctx) {
-        eventfd_signal(virtio_irq_ctx, 1);
-    } else if (task != NULL) {
+    if (dev->virtio_irq_ctx) {
+        eventfd_signal(dev->virtio_irq_ctx, 1);
+    } else if (dev->task != NULL) {
         // pr_info("send signal to hvisor device\n");
 #if (LINUX_VERSION_CODE <= KERNEL_VERSION(4, 20, 0))
-        if (send_sig_info(SIGHVI, (struct siginfo *)&info, task) < 0) {
+        if (send_sig_info(SIGHVI, (struct siginfo *)&info, dev->task) < 0) {
             pr_err("Unable to send signal\n");
         }
 #else
-        if (send_sig_info(SIGHVI, (struct kernel_siginfo *)&info, task) < 0) {
+        if (send_sig_info(SIGHVI, (struct kernel_siginfo *)&info, dev->task) < 0) {
             pr_err("Unable to send signal\n");
         }
 #endif
@@ -336,10 +271,20 @@ static irqreturn_t virtio_irq_handler(int irq, void *dev_id) {
 static int __init hvisor_init(void) {
     int err;
     struct device_node *node = NULL;
-    // u32 *irq;
-    err = misc_register(&hvisor_misc_dev);
+
+    global_hvisor_dev = kzalloc(sizeof(struct hvisor_device), GFP_KERNEL);
+    if (!global_hvisor_dev)
+        return -ENOMEM;
+    
+    global_hvisor_dev->virtio_irq = -1;
+    global_hvisor_dev->misc_dev.minor = MISC_DYNAMIC_MINOR;
+    global_hvisor_dev->misc_dev.name = "hvisor";
+    global_hvisor_dev->misc_dev.fops = &hvisor_fops;
+
+    err = misc_register(&global_hvisor_dev->misc_dev);
     if (err) {
         pr_err("hvisor_misc_register failed!!!\n");
+        kfree(global_hvisor_dev);
         return err;
     }
 #ifndef X86_64
@@ -354,13 +299,13 @@ static int __init hvisor_init(void) {
         pr_err("       compatible = \"hvisor\";\n");
         pr_err("       interrupts = <0x00 0x20 0x01>;\n");
         pr_err("   };\n");
-        return -ENODEV;
+        goto err_out;
     }
 
-    virtio_irq = of_irq_get(node, 0);
-    err = request_irq(virtio_irq, virtio_irq_handler,
+    global_hvisor_dev->virtio_irq = of_irq_get(node, 0);
+    err = request_irq(global_hvisor_dev->virtio_irq, virtio_irq_handler,
                       IRQF_SHARED | IRQF_TRIGGER_RISING, "hvisor_virtio_device",
-                      &hvisor_misc_dev);
+                      global_hvisor_dev);
     if (err)
         goto err_out;
 
@@ -369,11 +314,13 @@ static int __init hvisor_init(void) {
     // we don't use device tree in x86_64, so we have to get IRQ using hypercall
     u32 *irq = kmalloc(sizeof(u32), GFP_KERNEL);
     err = hvisor_call(HVISOR_HC_GET_VIRTIO_IRQ, __pa(irq), 0);
-    virtio_irq = *irq;
-    err = request_irq(virtio_irq, virtio_irq_handler, IRQF_SHARED,
-                      "hvisor_virtio_device", &hvisor_misc_dev);
-    if (err)
+    global_hvisor_dev->virtio_irq = *irq;
+    err = request_irq(global_hvisor_dev->virtio_irq, virtio_irq_handler, IRQF_SHARED,
+                      "hvisor_virtio_device", global_hvisor_dev);
+    if (err) {
+        kfree(irq);
         goto err_out;
+    }
 
     kfree(irq);
 #endif /* X86_64 */
@@ -381,9 +328,10 @@ static int __init hvisor_init(void) {
     return 0;
 err_out:
     pr_err("hvisor cannot register IRQ, err is %d\n", err);
-    if (virtio_irq != -1)
-        free_irq(virtio_irq, &hvisor_misc_dev);
-    misc_deregister(&hvisor_misc_dev);
+    if (global_hvisor_dev->virtio_irq != -1)
+        free_irq(global_hvisor_dev->virtio_irq, global_hvisor_dev);
+    misc_deregister(&global_hvisor_dev->misc_dev);
+    kfree(global_hvisor_dev);
     return err;
 }
 
@@ -391,15 +339,18 @@ err_out:
 ** Module Exit function
 */
 static void __exit hvisor_exit(void) {
-    if (virtio_irq != -1)
-        free_irq(virtio_irq, &hvisor_misc_dev);
-    if (virtio_irq_ctx)
-        eventfd_ctx_put(virtio_irq_ctx);
-    if (virtio_bridge != NULL) {
-        ClearPageReserved(virt_to_page(virtio_bridge));
-        free_pages((unsigned long)virtio_bridge, 0);
+    if (global_hvisor_dev) {
+        if (global_hvisor_dev->virtio_irq != -1)
+            free_irq(global_hvisor_dev->virtio_irq, global_hvisor_dev);
+        if (global_hvisor_dev->virtio_irq_ctx)
+            eventfd_ctx_put(global_hvisor_dev->virtio_irq_ctx);
+        if (global_hvisor_dev->virtio_bridge != NULL) {
+            ClearPageReserved(virt_to_page(global_hvisor_dev->virtio_bridge));
+            free_pages((unsigned long)global_hvisor_dev->virtio_bridge, 0);
+        }
+        misc_deregister(&global_hvisor_dev->misc_dev);
+        kfree(global_hvisor_dev);
     }
-    misc_deregister(&hvisor_misc_dev);
     pr_info("hvisor exit!!!\n");
 }
 
