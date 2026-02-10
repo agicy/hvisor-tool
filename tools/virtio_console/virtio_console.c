@@ -73,16 +73,15 @@ static void virtio_console_rx_completion_handler(void *param, int res) {
     free(req);
 }
 
-/// @brief Event handler for console events (Host -> Guest input).
+/// @brief Event handler for console PTY input (Host -> Guest).
 ///
-/// This function is triggered by io_uring when the master_fd (PTY) has data
-/// available (POLLIN). It handles the flow of data from the Host's PTY to the
-/// Guest's virtio-console RX queue.
+/// This function is triggered by io_uring when the master_fd (PTY) has data available (POLLIN).
+/// It handles the flow of data from the Host's PTY to the Guest's virtio-console RX queue.
 ///
 /// @param fd The file descriptor associated with the event (master_fd).
 /// @param epoll_type The type of event (e.g., POLLIN).
 /// @param param Pointer to the VirtIODevice structure.
-static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
+static void virtio_console_pty_rx_handler(int fd, int epoll_type, void *param) {
     VirtIODevice *vdev = (VirtIODevice *)param;
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     VirtQueue *vq = &vdev->vqs[CONSOLE_QUEUE_RX];
@@ -234,7 +233,7 @@ int virtio_console_init(VirtIODevice *vdev) {
 
     // Register master_fd to event loop for RX (Host -> Guest)
     dev->event =
-        add_event(dev->master_fd, POLLIN, virtio_console_event_handler, vdev);
+        add_event(dev->master_fd, POLLIN, virtio_console_pty_rx_handler, vdev);
 
     vdev->virtio_close = virtio_console_close;
     return 0;
@@ -245,7 +244,7 @@ int virtio_console_init(VirtIODevice *vdev) {
 /// @param vq Pointer to the VirtQueue structure.
 static void virtio_console_rxq_process(VirtIODevice *vdev, VirtQueue *vq) {
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
-    virtio_console_event_handler(dev->master_fd, POLLIN, vdev);
+    virtio_console_pty_rx_handler(dev->master_fd, POLLIN, vdev);
 }
 
 /// @brief Process the TX queue for the console device.
@@ -279,6 +278,12 @@ int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
 }
 
 /// @brief Notify handler for the RX queue.
+///
+/// This function is called by the virtio core when the Guest refills the RX queue
+/// (e.g., via virtqueue_kick). It is crucial for the backpressure mechanism:
+/// if we previously disabled PTY polling because the Guest had no buffers,
+/// this handler re-enables polling to resume data flow from Host to Guest.
+///
 /// @param vdev Pointer to the VirtIODevice structure.
 /// @param vq Pointer to the VirtQueue structure.
 /// @return 0 on success.
