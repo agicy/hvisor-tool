@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <sys/queue.h>
 #include <liburing.h>
+#include "event_monitor.h"
 
 /// Maximum number of segments in a request.
 #define BLK_SEG_MAX 512
@@ -34,18 +35,21 @@ typedef struct virtio_blk_outhdr BlkReqHead;
 
 // A request needed to process by blk thread.
 struct blkp_req {
+    TAILQ_ENTRY(blkp_req) link;
     struct iovec *iov;
     int iovcnt;
     uint64_t offset;
     uint32_t type;
     uint16_t idx;
-    struct virtio_blk_dev *dev; // Add back pointer to dev for callback
-    VirtQueue *vq; // Need VQ for completion
+    void *dev;
+    void *vq;
+    struct hvisor_event hevent;
 };
 
 typedef struct virtio_blk_dev {
     BlkConfig config;
     int img_fd;
+    TAILQ_HEAD(, blkp_req) procq;
 } BlkDev;
 
 BlkDev *init_blk_dev(VirtIODevice *vdev);

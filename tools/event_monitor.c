@@ -18,22 +18,13 @@
 #include "log.h"
 
 static struct io_uring ring;
-static pthread_mutex_t ring_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int events_num;
 pthread_t emonitor_tid;
 int closing;
-#define MAX_EVENTS 128
+#define MAX_EVENTS 64 // Increased from 16 to accommodate more events
 struct hvisor_event *events[MAX_EVENTS];
 
-void event_monitor_lock(void) {
-    pthread_mutex_lock(&ring_mutex);
-}
-
-void event_monitor_unlock(void) {
-    pthread_mutex_unlock(&ring_mutex);
-}
-
-struct io_uring *event_monitor_get_ring(void) {
+struct io_uring *get_global_ring(void) {
     return &ring;
 }
 
@@ -52,24 +43,22 @@ static void *io_uring_loop() {
 
         hevent = io_uring_cqe_get_data(cqe);
         if (hevent != NULL) {
-            // For IO completion, pass result as the first argument (replacing fd)
-            // or we can rely on param containing the buffer/iov.
-            // The handler signature is (int fd, int type, void *param).
-            // For IO events, we use fd=result, type=0.
-            if (hevent->type == EVENT_IO_ONESHOT) {
-                hevent->handler(cqe->res, 0, hevent->param);
-                // Free the oneshot event structure as it's not reused
-                free(hevent);
-            } else {
+            if (hevent->completion_handler) {
+                // Handle completion event (e.g., disk I/O completion)
+                bool free_on_completion = hevent->free_on_completion;
+                hevent->completion_handler(hevent->param, cqe->res);
+                if (free_on_completion) {
+                    free(hevent);
+                }
+            } else if (hevent->handler) {
+                // Handle poll event (e.g., network, console)
                 hevent->handler(hevent->fd, hevent->epoll_type, hevent->param);
                 
                 // Re-arm the poll request
-                pthread_mutex_lock(&ring_mutex);
                 struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
                 io_uring_prep_poll_add(sqe, hevent->fd, hevent->epoll_type);
                 io_uring_sqe_set_data(sqe, hevent);
                 io_uring_submit(&ring);
-                pthread_mutex_unlock(&ring_mutex);
             }
         } else {
             log_error("hevent shouldn't be null");
@@ -79,6 +68,15 @@ static void *io_uring_loop() {
     }
     pthread_exit(NULL);
     return NULL;
+}
+
+struct hvisor_event *add_completion_event(void (*handler)(void *, int), void *param) {
+    struct hvisor_event *hevent = calloc(1, sizeof(struct hvisor_event));
+    if (!hevent) return NULL;
+    hevent->completion_handler = handler;
+    hevent->param = param;
+    hevent->free_on_completion = true;
+    return hevent;
 }
 
 struct hvisor_event *add_event(int fd, int epoll_type,
@@ -99,14 +97,11 @@ struct hvisor_event *add_event(int fd, int epoll_type,
     hevent->param = param;
     hevent->fd = fd;
     hevent->epoll_type = epoll_type;
-    hevent->type = EVENT_POLL;
 
-    pthread_mutex_lock(&ring_mutex);
     sqe = io_uring_get_sqe(&ring);
     io_uring_prep_poll_add(sqe, fd, epoll_type);
     io_uring_sqe_set_data(sqe, hevent);
     io_uring_submit(&ring);
-    pthread_mutex_unlock(&ring_mutex);
 
     events[events_num] = hevent;
     events_num++;

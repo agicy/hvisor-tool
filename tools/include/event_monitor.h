@@ -11,28 +11,19 @@
 #ifndef HVISOR_EVENT_H
 #define HVISOR_EVENT_H
 #include <liburing.h>
-
-enum EventType {
-    EVENT_POLL,
-    EVENT_IO_ONESHOT
-};
+#include <stdbool.h>
 
 struct hvisor_event {
     void (*handler)(int, int, void *);
+    void (*completion_handler)(void *, int); // New handler for completion events
     void *param;
     int fd;
     int epoll_type;
-    enum EventType type;
+    bool free_on_completion;
 };
 
-int initialize_event_monitor(void);
-void destroy_event_monitor();
+struct io_uring *get_global_ring(void);
 struct hvisor_event *add_event(int fd, int epoll_type,
                                void (*handler)(int, int, void *), void *param);
-
-// Thread-safe ring access
-void event_monitor_lock(void);
-void event_monitor_unlock(void);
-struct io_uring *event_monitor_get_ring(void);
-
+struct hvisor_event *add_completion_event(void (*handler)(void *, int), void *param);
 #endif // HVISOR_EVENT_H
