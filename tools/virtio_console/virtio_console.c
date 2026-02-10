@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <termios.h>
+#include <poll.h>
 
 static uint8_t trashbuf[1024];
 
@@ -43,7 +44,7 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     struct iovec *iov = NULL;
     uint16_t idx;
 
-    if (epoll_type != EPOLLIN || fd != dev->master_fd) {
+    if (epoll_type != POLLIN || fd != dev->master_fd) {
         log_error("Invalid console event");
         return;
     }
@@ -124,7 +125,7 @@ int virtio_console_init(VirtIODevice *vdev) {
     }
 
     dev->event =
-        add_event(dev->master_fd, EPOLLIN, virtio_console_event_handler, vdev);
+        add_event(dev->master_fd, POLLIN, virtio_console_event_handler, vdev);
 
     if (dev->event == NULL) {
         log_error("Can't register console event");
