@@ -26,6 +26,7 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+#include <linux/eventfd.h>
 
 #include "hvisor.h"
 #include "zone_config.h"
@@ -33,6 +34,7 @@
 struct virtio_bridge *virtio_bridge;
 int virtio_irq = -1;
 static struct task_struct *task = NULL;
+struct eventfd_ctx *virtio_irq_ctx = NULL;
 
 // initial virtio el2 shared region
 static int hvisor_init_virtio(void) {
@@ -231,6 +233,17 @@ static long hvisor_ioctl(struct file *file, unsigned int ioctl,
     case HVISOR_CONFIG_CHECK:
         err = hvisor_config_check((u64 __user *)arg);
         break;
+    case HVISOR_SET_EVENTFD: {
+        struct eventfd_ctx *ctx = eventfd_ctx_fdget((int)arg);
+        if (IS_ERR(ctx)) {
+            err = PTR_ERR(ctx);
+        } else {
+            if (virtio_irq_ctx)
+                eventfd_ctx_put(virtio_irq_ctx);
+            virtio_irq_ctx = ctx;
+        }
+        break;
+    }
 #ifdef LOONGARCH64
     case HVISOR_CLEAR_INJECT_IRQ:
         err = hvisor_call(HVISOR_HC_CLEAR_INJECT_IRQ, 0, 0);
@@ -300,7 +313,9 @@ static irqreturn_t virtio_irq_handler(int irq, void *dev_id) {
     info.si_code = SI_QUEUE;
     info.si_int = 1;
     // Send signal SIGHVI to hvisor user task
-    if (task != NULL) {
+    if (virtio_irq_ctx) {
+        eventfd_signal(virtio_irq_ctx, 1);
+    } else if (task != NULL) {
         // pr_info("send signal to hvisor device\n");
 #if (LINUX_VERSION_CODE <= KERNEL_VERSION(4, 20, 0))
         if (send_sig_info(SIGHVI, (struct siginfo *)&info, task) < 0) {
@@ -378,6 +393,8 @@ err_out:
 static void __exit hvisor_exit(void) {
     if (virtio_irq != -1)
         free_irq(virtio_irq, &hvisor_misc_dev);
+    if (virtio_irq_ctx)
+        eventfd_ctx_put(virtio_irq_ctx);
     if (virtio_bridge != NULL) {
         ClearPageReserved(virt_to_page(virtio_bridge));
         free_pages((unsigned long)virtio_bridge, 0);
