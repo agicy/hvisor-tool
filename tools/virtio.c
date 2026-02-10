@@ -1321,6 +1321,27 @@ err_out:
     return err;
 }
 
+char *virtio_get_device_path(char *json_path) {
+    char *buffer = NULL;
+    uint64_t file_size;
+    char *path = NULL;
+
+    buffer = read_file(json_path, &file_size);
+    if (!buffer) return NULL;
+    buffer[file_size] = '\0';
+
+    cJSON *root = SAFE_CJSON_PARSE(buffer);
+    if (root) {
+        cJSON *item = cJSON_GetObjectItem(root, "device_path");
+        if (item && cJSON_IsString(item)) {
+            path = strdup(item->valuestring);
+        }
+        cJSON_Delete(root);
+    }
+    free(buffer);
+    return path;
+}
+
 int virtio_start(int argc, char *argv[]) {
     int opt, err = 0;
     err = virtio_init(); // Initialize virtio dependencies
