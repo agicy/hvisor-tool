@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /**
- * Copyright (c) 2025 Syswonder
- *
- * Syswonder Website:
- *      https://www.syswonder.org
- *
- * Authors:
- *      Guowei Li <2401213322@stu.pku.edu.cn>
- */
+ * Copyright (c) 2025 Syswonder
+ *
+ * Syswonder Website:
+ *      https://www.syswonder.org
+ *
+ * Authors:
+ *      Guowei Li <2401213322@stu.pku.edu.cn>
+ */
 #ifndef __HVISOR_VIRTIO_H
 #define __HVISOR_VIRTIO_H
+
+#include "event_monitor.h"
 #include "hvisor.h"
 #include "safe_cjson.h"
+
 #include <linux/virtio_config.h>
 #include <linux/virtio_mmio.h>
 #include <linux/virtio_ring.h>
@@ -23,25 +26,65 @@
 
 #define VIRT_QUEUE_SIZE 512
 
+/**
+ * @brief Memory-Mapped IO Registers for VirtIO Device
+ *
+ * This structure represents the layout of MMIO registers as defined in the
+ * VirtIO specification. It is used to communicate device status, features,
+ * and configuration between the Guest driver and the Host device.
+ */
 typedef struct VirtMmioRegs {
-    uint32_t device_id;       // Device type id, see VirtioDeviceType
-    uint32_t dev_feature_sel; // device_features_selection, the driver frontend
-                              // writes this register to obtain a group of
-                              // 32-bit device_features
-    uint32_t drv_feature_sel; // driver_features_selection, the driver frontend
-                              // writes this register to specify a group of
-                              // 32-bit activated device_features
-    uint32_t queue_sel; // The driver frontend writes this register to select
-                        // which virtqueue to use
-    uint32_t interrupt_status;
-    // interrupt_count doesn't exist in virtio specification,
-    // only used for ensuring the correctness of interrupt_status.
+    uint32_t device_id; /**< Device Type ID (e.g., 1 for Net, 2 for Block). See
+                           VirtioDeviceType. */
+    uint32_t
+        dev_feature_sel; /**< Device Features Selection. Written by the driver
+                            to select which 32-bit feature word to read. */
+    uint32_t
+        drv_feature_sel; /**< Driver Features Selection. Written by the driver
+                            to select which 32-bit feature word to write. */
+    uint32_t
+        queue_sel; /**< Queue Selector. Written by the driver to select the
+                      index of the virtqueue to configure. */
+    uint32_t interrupt_status; /**< Interrupt Status. Read by the driver to
+                                  check pending interrupts. */
+
+    /**
+     * @brief Internal Interrupt Counter.
+     * Not part of the VirtIO specification. Used internally by the backend
+     * to track interrupt coalescing or debugging.
+     */
     uint32_t interrupt_count;
-    uint32_t status;
-    uint32_t generation;
-    uint64_t dev_feature; // device_features
-    uint64_t drv_feature;
+
+    uint32_t
+        status; /**< Device Status. Written by the driver to indicate progress
+                   (e.g., ACKNOWLEDGE, DRIVER, DRIVER_OK). */
+    uint32_t generation; /**< Configuration Generation. Changed when the config
+                            space changes. */
+    uint64_t dev_feature; /**< Device Features bitmap (Host capabilities). */
+    uint64_t drv_feature; /**< Driver Features bitmap (Negotiated capabilities).
+                           */
 } VirtMmioRegs;
+
+/**
+ * @brief Unified VirtIO I/O Request Context
+ *
+ * This structure serves as the base class for all asynchronous I/O requests
+ * (Block, Network, Console). It encapsulates the common metadata required to
+ * process a VirtIO descriptor chain and submit it to io_uring.
+ */
+typedef struct VirtioIOReq {
+    struct iovec *iov; /**< Pointer to the scatter-gather list representing
+                          Guest memory buffers. */
+    int iovcnt;        /**< Number of segments in the iovec array. */
+    uint16_t idx;      /**< Descriptor Index in the VirtQueue (used to reply to
+                          Used Ring). */
+    VirtQueue *vq;     /**< Pointer to the VirtQueue this request belongs to. */
+    VirtIODevice
+        *vdev; /**< Pointer to the VirtIO Device instance this request belongs
+                  to. */
+    struct io_completion_event
+        io_completion_event; /**< Event handler context for io_uring completion callbacks. */
+} VirtioIOReq;
 
 typedef enum {
     VirtioTNone,
@@ -102,7 +145,6 @@ struct VirtQueue {
                                // the frontend driver of the backend processing
                                // progress Enabling this feature will change the
                                // flags field of the avail_ring
-    pthread_mutex_t used_ring_lock; // Used ring lock
 };
 
 // The highest abstruct representations of virtio device
@@ -200,7 +242,9 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
 
 bool in_range(uint64_t value, uint64_t lower, uint64_t len);
 
-void virtio_inject_irq(VirtQueue *vq); // unused
+void virtio_inject_irq(VirtQueue *vq);
+void virtio_enable_irq_poll(void);
+void virtio_sig_handler(int fd, int type, void *param); // unused
 
 void virtio_finish_cfg_req(uint32_t target_cpu, uint64_t value);
 
@@ -212,7 +256,7 @@ void handle_virtio_requests();
 
 void initialize_log();
 
-int virtio_init();
+int virtio_init(const char *device_path);
 
 int create_virtio_device_from_json(cJSON *device_json, int zone_id);
 
