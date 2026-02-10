@@ -73,8 +73,13 @@ static void virtio_console_rx_completion_handler(void *param, int res) {
     free(req);
 }
 
-/// @brief Event handler for console events
-/// @param fd The file descriptor associated with the event.
+/// @brief Event handler for console events (Host -> Guest input).
+///
+/// This function is triggered by io_uring when the master_fd (PTY) has data
+/// available (POLLIN). It handles the flow of data from the Host's PTY to the
+/// Guest's virtio-console RX queue.
+///
+/// @param fd The file descriptor associated with the event (master_fd).
 /// @param epoll_type The type of event (e.g., POLLIN).
 /// @param param Pointer to the VirtIODevice structure.
 static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
@@ -82,23 +87,39 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     VirtQueue *vq = &vdev->vqs[CONSOLE_QUEUE_RX];
 
+    // Validate event type and file descriptor
     if (epoll_type != POLLIN || fd != dev->master_fd) {
-        log_error("Invalid console event");
+        log_error("Invalid console event: fd=%d, type=%d", fd, epoll_type);
         return;
     }
 
     if (dev->master_fd <= 0 || vdev->type != VirtioTConsole) {
-        log_error("console event handler should not be called");
+        log_error("console event handler called with invalid state");
         return;
     }
 
-    // Handle pending RX request
+    // Case 1: Resume pending RX request
+    // If a previous read failed with EAGAIN (no data available at that moment
+    // but we had a buffer), we saved the request. Now that POLLIN triggered, we
+    // can retry reading into that buffer.
     if (dev->pending_rx_req) {
         struct console_req *req = dev->pending_rx_req;
         dev->pending_rx_req = NULL;
 
         struct io_uring *ring = get_global_ring();
         struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+        if (!sqe) {
+            // Ring is full, try to submit and retry
+            io_uring_submit(ring);
+            sqe = io_uring_get_sqe(ring);
+            if (!sqe) {
+                log_error("io_uring ring full, dropping RX request");
+                // Restore request for later retry? 
+                // Or just drop. Since we set pending_rx_req=NULL, we might lose it if we don't restore.
+                dev->pending_rx_req = req;
+                return;
+            }
+        }
 
         io_uring_prep_readv(sqe, dev->master_fd, req->iov, req->iovcnt, 0);
         io_uring_sqe_set_data(sqe, &req->hevent);
@@ -106,19 +127,35 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
         return;
     }
 
+    // Case 2: Guest is not ready to receive (rx_ready flag not set)
+    // We must drain the PTY to prevent it from blocking the writer, but drop
+    // the data.
     if (dev->rx_ready <= 0) {
         read(dev->master_fd, trashbuf, sizeof(trashbuf));
         return;
     }
+
+    // Case 3: Guest has no available buffers in RX Queue
+    // We cannot receive data now.
+    // Action:
+    // 1. Disable polling on master_fd to stop receiving POLLIN events (flow
+    // control).
+    // 2. Inject interrupt to Guest to remind it to refill the RX queue.
+    // When Guest refills queue, it will trigger a notify, where we re-enable
+    // polling.
     if (virtqueue_is_empty(vq)) {
         disable_event_poll(dev->event);
         virtio_inject_irq(vq);
         return;
     }
 
+    // Case 4: Normal Data Transfer
+    // Guest has provided buffers, and Host has data.
     struct console_req *req = calloc(1, sizeof(struct console_req));
     uint16_t idx;
     struct iovec *iov = NULL;
+
+    // Pop a buffer descriptor chain from Guest's RX Queue
     int n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
     if (n < 1) {
         free(req);
@@ -131,12 +168,24 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     req->idx = idx;
     req->vdev = vdev;
     req->vq = vq;
+    // Set up completion handler to update Used Ring after read finishes
     req->hevent.completion_handler = virtio_console_rx_completion_handler;
     req->hevent.param = req;
     req->hevent.free_on_completion = false;
 
+    // Submit async read from PTY into the Guest's buffer
     struct io_uring *ring = get_global_ring();
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+        io_uring_submit(ring);
+        sqe = io_uring_get_sqe(ring);
+        if (!sqe) {
+             log_error("io_uring ring full, dropping RX request");
+             free(req->iov);
+             free(req);
+             return;
+        }
+    }
     io_uring_prep_readv(sqe, dev->master_fd, req->iov, req->iovcnt, 0);
     io_uring_sqe_set_data(sqe, &req->hevent);
     io_uring_submit(ring);
@@ -203,13 +252,19 @@ static void virtio_console_rxq_process(VirtIODevice *vdev, VirtQueue *vq) {
 /// @param vq Pointer to the VirtQueue structure.
 static void virtio_console_txq_process(VirtIODevice *vdev, VirtQueue *vq) {
     int quota = 64;
+    int submitted = 0;
     while (!virtqueue_is_empty(vq) && quota > 0) {
         virtqueue_disable_notify(vq);
         while (!virtqueue_is_empty(vq) && quota > 0) {
-            virtq_tx_handle_one_request(vdev->dev, vq);
+            if (virtq_tx_handle_one_request(vdev->dev, vq) == 0) {
+                submitted++;
+            }
             quota--;
         }
         virtqueue_enable_notify(vq);
+    }
+    if (submitted > 0) {
+        io_uring_submit(get_global_ring());
     }
 }
 
@@ -254,20 +309,21 @@ static void virtio_console_tx_completion_handler(void *param, int res) {
 /// @brief Handle a single request from the TX queue.
 /// @param dev Pointer to the ConsoleDev structure.
 /// @param vq Pointer to the VirtQueue structure.
-static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
+/// @return 0 on success, -1 on failure.
+static int virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
     VirtIODevice *vdev = vq->dev;
     int n;
     uint16_t idx;
     struct iovec *iov = NULL;
     if (dev->master_fd <= 0) {
         log_error("Console master fd is not ready");
-        return;
+        return -1;
     }
 
     n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
 
     if (n < 1) {
-        return;
+        return -1;
     }
 
     struct console_req *req = calloc(1, sizeof(struct console_req));
@@ -282,9 +338,23 @@ static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
 
     struct io_uring *ring = get_global_ring();
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    
+    if (!sqe) {
+        // Try to clear some space
+        io_uring_submit(ring);
+        sqe = io_uring_get_sqe(ring);
+        if (!sqe) {
+             log_error("io_uring ring full, dropping TX packet");
+             free(req->iov);
+             free(req);
+             return -1;
+        }
+    }
+
     io_uring_prep_writev(sqe, dev->master_fd, req->iov, req->iovcnt, 0);
     io_uring_sqe_set_data(sqe, &req->hevent);
-    io_uring_submit(ring);
+    // Batching: do not submit here
+    return 0;
 }
 
 /// @brief Close the virtio console device and release resources.
