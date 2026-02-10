@@ -26,7 +26,10 @@
 #include <sys/time.h>
 #include <termios.h>
 
-static uint8_t trashbuf[1024];
+#define CONSOLE_TRASH_BUF_SIZE 1024
+#define CONSOLE_TX_BATCH_QUOTA 64
+
+static uint8_t trashbuf[CONSOLE_TRASH_BUF_SIZE];
 
 /// @brief Initialize the console device.
 /// @return Pointer to the initialized ConsoleDev structure.
@@ -35,6 +38,7 @@ ConsoleDev *init_console_dev() {
     dev->config.cols = CONSOLE_DEFAULT_COLS;
     dev->config.rows = CONSOLE_DEFAULT_ROWS;
     dev->master_fd = -1;
+    dev->slave_fd = -1;
     dev->rx_ready = -1;
     dev->event = NULL;
     dev->pending_rx_req = NULL;
@@ -75,8 +79,9 @@ static void virtio_console_rx_completion_handler(void *param, int res) {
 
 /// @brief Event handler for console PTY input (Host -> Guest).
 ///
-/// This function is triggered by io_uring when the master_fd (PTY) has data available (POLLIN).
-/// It handles the flow of data from the Host's PTY to the Guest's virtio-console RX queue.
+/// This function is triggered by io_uring when the master_fd (PTY) has data
+/// available (POLLIN). It handles the flow of data from the Host's PTY to the
+/// Guest's virtio-console RX queue.
 ///
 /// @param fd The file descriptor associated with the event (master_fd).
 /// @param epoll_type The type of event (e.g., POLLIN).
@@ -200,34 +205,62 @@ int virtio_console_init(VirtIODevice *vdev) {
     char *slave_name;
     struct termios term_io;
 
+    // Open a new pty pair (master and slave)
+    // - master: Used by the Host to write or read from the Guest.
+    // - slave: Used to temporarily configure the terminal attributes.
+    // Flags:
+    // - O_RDWR: Open for reading and writing.
+    // - O_NOCTTY: If the device is a terminal, do not make it the controlling
+    // terminal for the process.
     master_fd = posix_openpt(O_RDWR | O_NOCTTY);
     if (master_fd < 0) {
         log_error("Failed to open master pty, errno is %d", errno);
     }
+
+    // Change the mode and owner of the slave PTY device
     if (grantpt(master_fd) < 0) {
         log_error("Failed to grant pty, errno is %d", errno);
     }
+
+    // Unlock the slave PTY device to allow it to be opened
     if (unlockpt(master_fd) < 0) {
         log_error("Failed to unlock pty, errno is %d", errno);
     }
+
     dev->master_fd = master_fd;
 
+    // Get the name of the slave PTY device
     slave_name = ptsname(master_fd);
-    if (slave_name == NULL) {
+    if (!slave_name) {
         log_error("Failed to get slave name, errno is %d", errno);
     }
     log_info("char device redirected to %s", slave_name);
-    // Disable line discipline to prevent the TTY
-    // from echoing the characters sent from the master back to the master.
+
+    // Configure the Slave PTY to "Raw Mode".
+    // We open the slave side temporarily just to configure the terminal
+    // attributes. Raw Mode is essential for a virtio-console because the Guest
+    // OS expects a raw byte stream. We don't want the Host kernel to process:
+    // - Echoing (printing back what is typed)
+    // - Line buffering (waiting for Enter key)
+    // - Signal generation (Ctrl-C sending SIGINT)
     slave_fd = open(slave_name, O_RDWR);
     tcgetattr(slave_fd, &term_io);
-    cfmakeraw(&term_io);
+    cfmakeraw(&term_io); // Set the terminal to raw mode
     tcsetattr(slave_fd, TCSAFLUSH, &term_io);
-    close(slave_fd);
+    // Note: We intentionally do NOT close slave_fd here.
+    // By keeping the slave fd open in this process, we ensure that the master
+    // PTY always has at least one active client. This prevents read(master_fd)
+    // from returning EIO when no external user is connected, which would cause
+    // the io_uring loop to busy-spin.
+    dev->slave_fd = slave_fd;
 
+    // Set the master FD to non-blocking mode
+    // This allows us to use io_uring for asynchronous I/O operations
     if (set_nonblocking(dev->master_fd) < 0) {
-        dev->master_fd = -1;
         close(dev->master_fd);
+        dev->master_fd = -1;
+        close(dev->slave_fd);
+        dev->slave_fd = -1;
         log_error("Failed to set nonblocking mode, fd closed!");
     }
 
@@ -239,19 +272,11 @@ int virtio_console_init(VirtIODevice *vdev) {
     return 0;
 }
 
-/// @brief Process the RX queue for the console device.
-/// @param vdev Pointer to the VirtIODevice structure.
-/// @param vq Pointer to the VirtQueue structure.
-static void virtio_console_rxq_process(VirtIODevice *vdev, VirtQueue *vq) {
-    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
-    virtio_console_pty_rx_handler(dev->master_fd, POLLIN, vdev);
-}
-
 /// @brief Process the TX queue for the console device.
 /// @param vdev Pointer to the VirtIODevice structure.
 /// @param vq Pointer to the VirtQueue structure.
 static void virtio_console_txq_process(VirtIODevice *vdev, VirtQueue *vq) {
-    int quota = 64;
+    int quota = CONSOLE_TX_BATCH_QUOTA;
     int submitted = 0;
     while (!virtqueue_is_empty(vq) && quota > 0) {
         virtqueue_disable_notify(vq);
@@ -279,10 +304,11 @@ int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
 
 /// @brief Notify handler for the RX queue.
 ///
-/// This function is called by the virtio core when the Guest refills the RX queue
-/// (e.g., via virtqueue_kick). It is crucial for the backpressure mechanism:
-/// if we previously disabled PTY polling because the Guest had no buffers,
-/// this handler re-enables polling to resume data flow from Host to Guest.
+/// This function is called by the virtio core when the Guest refills the RX
+/// queue (e.g., via virtqueue_kick). It is crucial for the backpressure
+/// mechanism: if we previously disabled PTY polling because the Guest had no
+/// buffers, this handler re-enables polling to resume data flow from Host to
+/// Guest.
 ///
 /// @param vdev Pointer to the VirtIODevice structure.
 /// @param vq Pointer to the VirtQueue structure.
@@ -291,7 +317,8 @@ int virtio_console_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     log_debug("%s", __func__);
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     enable_event_poll(dev->event);
-    virtio_console_rxq_process(vdev, vq);
+    // No need to manually call process_queue here.
+    // enabling event poll will trigger pty_rx_handler if data is available.
     return 0;
 }
 
@@ -369,6 +396,9 @@ void virtio_console_close(VirtIODevice *vdev) {
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     if (dev->master_fd >= 0) {
         close(dev->master_fd);
+    }
+    if (dev->slave_fd >= 0) {
+        close(dev->slave_fd);
     }
     free(dev);
     free(vdev->vqs);

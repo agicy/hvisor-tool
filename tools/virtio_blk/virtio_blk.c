@@ -135,6 +135,15 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
     blk_size = st.st_size / 512; // 512 bytes per block
     dev->config.capacity = blk_size;
     dev->config.size_max = blk_size;
+    
+    // Set non-blocking mode for safety, though io_uring handles regular files well.
+    // This is critical if img_path refers to a character device or block device.
+    if (set_nonblocking(img_fd) < 0) {
+        log_warn("Failed to set nonblocking mode for block device %s", img_path);
+        // We continue even if this fails, as regular files might not support it
+        // but io_uring will still work.
+    }
+
     dev->img_fd = img_fd;
     vdev->virtio_close = virtio_blk_close;
     log_info("debug: virtio_blk_init: %s, size is %lld", img_path,
