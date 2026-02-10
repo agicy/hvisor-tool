@@ -27,6 +27,7 @@
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <linux/eventfd.h>
+#include <linux/platform_device.h>
 
 #include "hvisor.h"
 #include "zone_config.h"
@@ -38,8 +39,6 @@ struct hvisor_device {
     struct task_struct *task;
     struct eventfd_ctx *virtio_irq_ctx;
 };
-
-static struct hvisor_device *global_hvisor_dev;
 
 // initial virtio el2 shared region
 static int hvisor_init_virtio(struct hvisor_device *dev) {
@@ -265,92 +264,124 @@ static irqreturn_t virtio_irq_handler(int irq, void *dev_id) {
     return IRQ_HANDLED;
 }
 
+static int hvisor_probe(struct platform_device *pdev) {
+    struct hvisor_device *dev;
+    int err;
+    const char *dev_name;
+
+    dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+    if (!dev)
+        return -ENOMEM;
+
+    dev->virtio_irq = -1;
+    platform_set_drvdata(pdev, dev);
+
+#ifndef X86_64
+    dev->virtio_irq = platform_get_irq(pdev, 0);
+    if (dev->virtio_irq < 0) {
+        return dev->virtio_irq;
+    }
+#else
+    {
+        u32 *irq = kmalloc(sizeof(u32), GFP_KERNEL);
+        if (!irq) return -ENOMEM;
+        err = hvisor_call(HVISOR_HC_GET_VIRTIO_IRQ, __pa(irq), 0);
+        dev->virtio_irq = *irq;
+        kfree(irq);
+    }
+#endif
+
+    // Use device id for unique naming if available
+    if (pdev->id != -1)
+        dev_name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "hvisor%d", pdev->id);
+    else
+        dev_name = "hvisor";
+
+    dev->misc_dev.minor = MISC_DYNAMIC_MINOR;
+    dev->misc_dev.name = dev_name;
+    dev->misc_dev.fops = &hvisor_fops;
+
+    err = misc_register(&dev->misc_dev);
+    if (err) {
+        pr_err("hvisor_misc_register failed for %s!!!\n", dev_name);
+        return err;
+    }
+
+    err = devm_request_irq(&pdev->dev, dev->virtio_irq, virtio_irq_handler,
+                           IRQF_SHARED | IRQF_TRIGGER_RISING, dev_name,
+                           dev);
+    if (err) {
+        misc_deregister(&dev->misc_dev);
+        return err;
+    }
+    
+    pr_info("hvisor device %s probed, irq %d\n", dev_name, dev->virtio_irq);
+    return 0;
+}
+
+static int hvisor_remove(struct platform_device *pdev) {
+    struct hvisor_device *dev = platform_get_drvdata(pdev);
+
+    if (dev->virtio_irq_ctx)
+        eventfd_ctx_put(dev->virtio_irq_ctx);
+
+    if (dev->virtio_bridge != NULL) {
+        ClearPageReserved(virt_to_page(dev->virtio_bridge));
+        free_pages((unsigned long)dev->virtio_bridge, 0);
+    }
+
+    misc_deregister(&dev->misc_dev);
+    return 0;
+}
+
+static const struct of_device_id hvisor_dt_ids[] = {
+    { .compatible = "hvisor", },
+    { /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, hvisor_dt_ids);
+
+static struct platform_driver hvisor_driver = {
+    .probe = hvisor_probe,
+    .remove = hvisor_remove,
+    .driver = {
+        .name = "hvisor",
+        .of_match_table = hvisor_dt_ids,
+    },
+};
+
+#ifdef X86_64
+static struct platform_device *hvisor_pdev;
+#endif
+
 /*
 ** Module Init function
 */
 static int __init hvisor_init(void) {
-    int err;
-    struct device_node *node = NULL;
+    int ret;
+    ret = platform_driver_register(&hvisor_driver);
+    if (ret)
+        return ret;
 
-    global_hvisor_dev = kzalloc(sizeof(struct hvisor_device), GFP_KERNEL);
-    if (!global_hvisor_dev)
-        return -ENOMEM;
-    
-    global_hvisor_dev->virtio_irq = -1;
-    global_hvisor_dev->misc_dev.minor = MISC_DYNAMIC_MINOR;
-    global_hvisor_dev->misc_dev.name = "hvisor";
-    global_hvisor_dev->misc_dev.fops = &hvisor_fops;
-
-    err = misc_register(&global_hvisor_dev->misc_dev);
-    if (err) {
-        pr_err("hvisor_misc_register failed!!!\n");
-        kfree(global_hvisor_dev);
-        return err;
+#ifdef X86_64
+    // Manually register device for x86 to trigger probe
+    hvisor_pdev = platform_device_register_simple("hvisor", 0, NULL, 0);
+    if (IS_ERR(hvisor_pdev)) {
+        platform_driver_unregister(&hvisor_driver);
+        return PTR_ERR(hvisor_pdev);
     }
-#ifndef X86_64
-    // probe hvisor virtio device.
-    // The irq number must be retrieved from dtb node, because it is different
-    // from GIC's IRQ number.
-    node = of_find_node_by_path("/hvisor_virtio_device");
-    if (!node) {
-        pr_err("Critical: Missing device tree node!\n");
-        pr_err("   Please add the following to your device tree:\n");
-        pr_err("   hvisor_virtio_device {\n");
-        pr_err("       compatible = \"hvisor\";\n");
-        pr_err("       interrupts = <0x00 0x20 0x01>;\n");
-        pr_err("   };\n");
-        goto err_out;
-    }
-
-    global_hvisor_dev->virtio_irq = of_irq_get(node, 0);
-    err = request_irq(global_hvisor_dev->virtio_irq, virtio_irq_handler,
-                      IRQF_SHARED | IRQF_TRIGGER_RISING, "hvisor_virtio_device",
-                      global_hvisor_dev);
-    if (err)
-        goto err_out;
-
-    of_node_put(node);
-#else
-    // we don't use device tree in x86_64, so we have to get IRQ using hypercall
-    u32 *irq = kmalloc(sizeof(u32), GFP_KERNEL);
-    err = hvisor_call(HVISOR_HC_GET_VIRTIO_IRQ, __pa(irq), 0);
-    global_hvisor_dev->virtio_irq = *irq;
-    err = request_irq(global_hvisor_dev->virtio_irq, virtio_irq_handler, IRQF_SHARED,
-                      "hvisor_virtio_device", global_hvisor_dev);
-    if (err) {
-        kfree(irq);
-        goto err_out;
-    }
-
-    kfree(irq);
-#endif /* X86_64 */
-    pr_info("hvisor init done!!!\n");
+#endif
+    pr_info("hvisor driver initialized\n");
     return 0;
-err_out:
-    pr_err("hvisor cannot register IRQ, err is %d\n", err);
-    if (global_hvisor_dev->virtio_irq != -1)
-        free_irq(global_hvisor_dev->virtio_irq, global_hvisor_dev);
-    misc_deregister(&global_hvisor_dev->misc_dev);
-    kfree(global_hvisor_dev);
-    return err;
 }
 
 /*
 ** Module Exit function
 */
 static void __exit hvisor_exit(void) {
-    if (global_hvisor_dev) {
-        if (global_hvisor_dev->virtio_irq != -1)
-            free_irq(global_hvisor_dev->virtio_irq, global_hvisor_dev);
-        if (global_hvisor_dev->virtio_irq_ctx)
-            eventfd_ctx_put(global_hvisor_dev->virtio_irq_ctx);
-        if (global_hvisor_dev->virtio_bridge != NULL) {
-            ClearPageReserved(virt_to_page(global_hvisor_dev->virtio_bridge));
-            free_pages((unsigned long)global_hvisor_dev->virtio_bridge, 0);
-        }
-        misc_deregister(&global_hvisor_dev->misc_dev);
-        kfree(global_hvisor_dev);
-    }
+#ifdef X86_64
+    platform_device_unregister(hvisor_pdev);
+#endif
+    platform_driver_unregister(&hvisor_driver);
     pr_info("hvisor exit!!!\n");
 }
 
