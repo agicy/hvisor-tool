@@ -28,13 +28,19 @@ typedef struct virtio_console_dev {
     int rx_ready;
     struct hvisor_event *event;
     struct termios old_termios;
+    struct console_req *pending_rx_req;
     
-    // Worker related
-    pthread_t worker_tid;
-    struct io_uring ring;
     int kick_fd;
-    bool stop;
 } ConsoleDev;
+
+struct console_req {
+    struct iovec *iov;
+    int iovcnt;
+    uint16_t idx;
+    struct hvisor_event hevent;
+    VirtIODevice *vdev;
+    VirtQueue *vq;
+};
 
 ConsoleDev *init_console_dev();
 int virtio_console_init(VirtIODevice *vdev);

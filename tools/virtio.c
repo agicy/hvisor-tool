@@ -932,6 +932,9 @@ void virtio_inject_irq(VirtQueue *vq) {
 
     while (is_queue_full(virtio_bridge->res_front, virtio_bridge->res_rear,
                          MAX_REQ)) {
+        pthread_mutex_unlock(&RES_MUTEX);
+        usleep(10);
+        pthread_mutex_lock(&RES_MUTEX);
     }
     unsigned int res_rear = virtio_bridge->res_rear;
     res = &virtio_bridge->res_list[res_rear];

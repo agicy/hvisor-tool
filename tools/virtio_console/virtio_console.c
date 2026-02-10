@@ -34,7 +34,33 @@ ConsoleDev *init_console_dev() {
     dev->master_fd = -1;
     dev->rx_ready = -1;
     dev->event = NULL;
+    dev->pending_rx_req = NULL;
     return dev;
+}
+
+static void virtio_console_rx_completion_handler(void *param, int res) {
+    struct console_req *req = (struct console_req *)param;
+    VirtIODevice *vdev = req->vdev;
+    // ConsoleDev *dev = vdev->dev;
+    VirtQueue *vq = req->vq;
+
+    if (res == -EAGAIN) {
+        ConsoleDev *dev = (ConsoleDev *)vdev->dev;
+        dev->pending_rx_req = req;
+        return;
+    }
+
+    if (res < 0) {
+        if (res != -ECANCELED)
+             log_trace("console rx error: %d", res);
+        res = 0;
+    }
+    
+    update_used_ring(vq, req->idx, res);
+    virtio_inject_irq(vq);
+    
+    free(req->iov);
+    free(req);
 }
 
 static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
@@ -42,11 +68,7 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     VirtIODevice *vdev = (VirtIODevice *)param;
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     VirtQueue *vq = &vdev->vqs[CONSOLE_QUEUE_RX];
-    int n;
-    ssize_t len;
-    struct iovec *iov = NULL;
-    uint16_t idx;
-
+    
     if (epoll_type != POLLIN || fd != dev->master_fd) {
         log_error("Invalid console event");
         return;
@@ -55,39 +77,68 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
         log_error("console event handler should not be called");
         return;
     }
+
+    if (dev->pending_rx_req) {
+        struct console_req *req = dev->pending_rx_req;
+        dev->pending_rx_req = NULL;
+        
+        struct io_uring *ring = get_global_ring();
+        pthread_mutex_t *ring_mutex = get_global_ring_mutex();
+        pthread_mutex_lock(ring_mutex);
+        struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+        io_uring_prep_readv(sqe, dev->master_fd, req->iov, req->iovcnt, 0);
+        io_uring_sqe_set_data(sqe, &req->hevent);
+        io_uring_submit(ring);
+        pthread_mutex_unlock(ring_mutex);
+        return;
+    }
+
     if (dev->rx_ready <= 0) {
         read(dev->master_fd, trashbuf, sizeof(trashbuf));
         return;
     }
     if (virtqueue_is_empty(vq)) {
-        read(dev->master_fd, trashbuf, sizeof(trashbuf));
+        disable_event_poll(dev->event);
         virtio_inject_irq(vq);
         return;
     }
 
-    while (!virtqueue_is_empty(vq)) {
-        n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
-        if (n < 1) {
-            log_error("process_descriptor_chain failed");
-            break;
-        }
-        len = readv(dev->master_fd, iov, n);
-        if (len < 0 && errno == EWOULDBLOCK) {
-            log_debug("no more bytes");
-            vq->last_avail_idx--;
-            free(iov);
-            break;
-        } else if (len < 0) {
-            log_trace("Failed to read from console, errno is %d", errno);
-            vq->last_avail_idx--;
-            free(iov);
-            break;
-        }
-        update_used_ring(vq, idx, len);
-        free(iov);
+    struct console_req *req = calloc(1, sizeof(struct console_req));
+    uint16_t idx;
+    struct iovec *iov = NULL;
+    int n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
+    if (n < 1) {
+        free(req);
+        // log_error("process_descriptor_chain failed");
+        return;
     }
-    virtio_inject_irq(vq);
-    return;
+
+    req->iov = iov;
+    req->iovcnt = n;
+    req->idx = idx;
+    req->vdev = vdev;
+    req->vq = vq;
+    req->hevent.completion_handler = virtio_console_rx_completion_handler;
+    req->hevent.param = req;
+    req->hevent.free_on_completion = false;
+
+    struct io_uring *ring = get_global_ring();
+    pthread_mutex_t *ring_mutex = get_global_ring_mutex();
+    pthread_mutex_lock(ring_mutex);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_readv(sqe, dev->master_fd, req->iov, req->iovcnt, 0);
+    io_uring_sqe_set_data(sqe, &req->hevent);
+    io_uring_submit(ring);
+    pthread_mutex_unlock(ring_mutex);
+}
+
+static void virtio_console_kick_handler(int fd, int epoll_type, void *param) {
+    VirtIODevice *vdev = (VirtIODevice *)param;
+    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
+    uint64_t val;
+    read(fd, &val, sizeof(val));
+    virtio_console_txq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_TX]);
+    virtio_console_rxq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_RX]);
 }
 
 int virtio_console_init(VirtIODevice *vdev) {
@@ -129,31 +180,13 @@ int virtio_console_init(VirtIODevice *vdev) {
 
     // Init worker
     dev->kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    io_uring_queue_init(32, &dev->ring, 0);
+    if (dev->kick_fd < 0) {
+        log_error("eventfd failed");
+        return -1;
+    }
 
-    // Add kick_fd poll
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
-    struct hvisor_event *kick_event = calloc(1, sizeof(struct hvisor_event));
-    kick_event->fd = dev->kick_fd;
-    kick_event->epoll_type = POLLIN;
-    kick_event->handler = (void*)1; // Marker
-    kick_event->param = vdev;
-    io_uring_prep_poll_add(sqe, dev->kick_fd, POLLIN);
-    io_uring_sqe_set_data(sqe, kick_event);
-    io_uring_submit(&dev->ring);
-
-    // Add master_fd poll
-    sqe = io_uring_get_sqe(&dev->ring);
-    struct hvisor_event *master_event = calloc(1, sizeof(struct hvisor_event));
-    master_event->fd = dev->master_fd;
-    master_event->epoll_type = POLLIN;
-    master_event->handler = (void*)2; // Marker
-    master_event->param = vdev;
-    io_uring_prep_poll_add(sqe, dev->master_fd, POLLIN);
-    io_uring_sqe_set_data(sqe, master_event);
-    io_uring_submit(&dev->ring);
-
-    pthread_create(&dev->worker_tid, NULL, virtio_console_worker, vdev);
+    add_event(dev->kick_fd, POLLIN, virtio_console_kick_handler, vdev);
+    dev->event = add_event(dev->master_fd, POLLIN, virtio_console_event_handler, vdev);
 
     vdev->virtio_close = virtio_console_close;
     return 0;
@@ -165,74 +198,49 @@ static void virtio_console_rxq_process(VirtIODevice *vdev, VirtQueue *vq) {
 }
 
 static void virtio_console_txq_process(VirtIODevice *vdev, VirtQueue *vq) {
-    while (!virtqueue_is_empty(vq)) {
+    int quota = 64;
+    while (!virtqueue_is_empty(vq) && quota > 0) {
         virtqueue_disable_notify(vq);
-        while (!virtqueue_is_empty(vq)) {
+        while (!virtqueue_is_empty(vq) && quota > 0) {
             virtq_tx_handle_one_request(vdev->dev, vq);
+            quota--;
         }
         virtqueue_enable_notify(vq);
     }
-}
-
-static void *virtio_console_worker(void *arg) {
-    VirtIODevice *vdev = (VirtIODevice *)arg;
-    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
-    struct io_uring_cqe *cqe;
-    struct hvisor_event *hevent;
-    int ret;
-    uint64_t val;
-
-    while (!dev->stop) {
-        ret = io_uring_submit_and_wait(&dev->ring, 1);
-        if (ret < 0) {
-            if (ret != -EINTR) log_error("io_uring wait error: %d", ret);
-            continue;
-        }
-
-        struct io_uring_cqe *cqes[16];
-        int count = io_uring_peek_batch_cqe(&dev->ring, cqes, 16);
-        
-        for (int i = 0; i < count; i++) {
-            cqe = cqes[i];
-            hevent = io_uring_cqe_get_data(cqe);
-            
-            if (hevent) {
-                if (hevent->handler == (void*)1) { // Kick Event
-                     read(dev->kick_fd, &val, sizeof(val));
-                     virtio_console_txq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_TX]);
-                     virtio_console_rxq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_RX]);
-                     
-                     struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
-                     io_uring_prep_poll_add(sqe, dev->kick_fd, POLLIN);
-                     io_uring_sqe_set_data(sqe, hevent);
-                     io_uring_submit(&dev->ring);
-                } else if (hevent->handler == (void*)2) { // Master FD Event
-                     virtio_console_rxq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_RX]);
-                     
-                     struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
-                     io_uring_prep_poll_add(sqe, dev->master_fd, POLLIN);
-                     io_uring_sqe_set_data(sqe, hevent);
-                     io_uring_submit(&dev->ring);
-                }
-            }
-            io_uring_cqe_seen(&dev->ring, cqe);
-        }
+    if (!virtqueue_is_empty(vq)) {
+        ConsoleDev *dev = (ConsoleDev *)vdev->dev;
+        uint64_t val = 1;
+        write(dev->kick_fd, &val, sizeof(val));
     }
-    return NULL;
 }
 
 int virtio_console_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     log_debug("%s", __func__);
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     uint64_t val = 1;
+    enable_event_poll(dev->event);
     write(dev->kick_fd, &val, sizeof(val));
     return 0;
 }
 
+static void virtio_console_tx_completion_handler(void *param, int res) {
+    struct console_req *req = (struct console_req *)param;
+    VirtQueue *vq = req->vq;
+    
+    if (res < 0) {
+        log_error("console tx error: %d", res);
+        res = 0;
+    }
+    
+    update_used_ring(vq, req->idx, 0); 
+    free(req->iov);
+    free(req);
+}
+
 static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
+    VirtIODevice *vdev = vq->dev;
     int n;
     uint16_t idx;
-    ssize_t len;
     struct iovec *iov = NULL;
     if (dev->master_fd <= 0) {
         log_error("Console master fd is not ready");
@@ -245,12 +253,24 @@ static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
         return;
     }
 
-    len = writev(dev->master_fd, iov, n);
-    if (len < 0) {
-        log_error("Failed to write to console, errno is %d", errno);
-    }
-    update_used_ring(vq, idx, 0);
-    free(iov);
+    struct console_req *req = calloc(1, sizeof(struct console_req));
+    req->iov = iov;
+    req->iovcnt = n;
+    req->idx = idx;
+    req->vdev = vdev;
+    req->vq = vq;
+    req->hevent.completion_handler = virtio_console_tx_completion_handler;
+    req->hevent.param = req;
+    req->hevent.free_on_completion = false;
+    
+    struct io_uring *ring = get_global_ring();
+    pthread_mutex_t *ring_mutex = get_global_ring_mutex();
+    pthread_mutex_lock(ring_mutex);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_writev(sqe, dev->master_fd, req->iov, req->iovcnt, 0);
+    io_uring_sqe_set_data(sqe, &req->hevent);
+    io_uring_submit(ring);
+    pthread_mutex_unlock(ring_mutex);
 }
 
 int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
@@ -264,6 +284,7 @@ int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
 void virtio_console_close(VirtIODevice *vdev) {
     ConsoleDev *dev = vdev->dev;
     close(dev->master_fd);
+    close(dev->kick_fd);
     free(dev->event);
     free(dev);
     free(vdev->vqs);

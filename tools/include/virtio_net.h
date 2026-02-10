@@ -36,13 +36,20 @@ typedef struct virtio_net_dev {
     int tapfd;
     int rx_ready;
     struct hvisor_event *event;
+    struct net_req *pending_rx_req;
     
-    // Worker related
-    pthread_t worker_tid;
-    struct io_uring ring;
     int kick_fd;
-    bool stop;
 } NetDev;
+
+struct net_req {
+    struct iovec *iov;      // Original iov for freeing
+    struct iovec *iov_packet; // iov for readv/writev
+    int iovcnt;             // Count for iov_packet
+    uint16_t idx;
+    struct hvisor_event hevent;
+    VirtIODevice *vdev;
+    VirtQueue *vq;
+};
 
 NetDev *init_net_dev(uint8_t mac[]);
 

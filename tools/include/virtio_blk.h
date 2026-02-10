@@ -50,12 +50,7 @@ typedef struct virtio_blk_dev {
     BlkConfig config;
     int img_fd;
     TAILQ_HEAD(, blkp_req) procq;
-    
-    // Worker related
-    pthread_t worker_tid;
-    struct io_uring ring;
     int kick_fd;
-    bool stop;
 } BlkDev;
 
 BlkDev *init_blk_dev(VirtIODevice *vdev);

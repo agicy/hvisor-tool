@@ -18,14 +18,19 @@
 #include "log.h"
 
 static struct io_uring ring;
+static pthread_mutex_t ring_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int events_num;
 pthread_t emonitor_tid;
 int closing;
-#define MAX_EVENTS 64 // Increased from 16 to accommodate more events
+#define MAX_EVENTS 4096 // Increased for high concurrency
 struct hvisor_event *events[MAX_EVENTS];
 
 struct io_uring *get_global_ring(void) {
     return &ring;
+}
+
+pthread_mutex_t *get_global_ring_mutex(void) {
+    return &ring_mutex;
 }
 
 static void *io_uring_loop() {
@@ -52,13 +57,25 @@ static void *io_uring_loop() {
                 }
             } else if (hevent->handler) {
                 // Handle poll event (e.g., network, console)
-                hevent->handler(hevent->fd, hevent->epoll_type, hevent->param);
+                // Check for errors or cancellation
+                if (cqe->res < 0 && cqe->res != -EAGAIN && cqe->res != -EINTR) {
+                     // If multishot poll fails or is canceled, we might need to handle it.
+                     // For now, just log it.
+                     if (cqe->res != -ECANCELED)
+                        log_debug("poll event error: %d", cqe->res);
+                } else {
+                    hevent->handler(hevent->fd, hevent->epoll_type, hevent->param);
+                }
                 
-                // Re-arm the poll request
-                struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-                io_uring_prep_poll_add(sqe, hevent->fd, hevent->epoll_type);
-                io_uring_sqe_set_data(sqe, hevent);
-                io_uring_submit(&ring);
+                // Multishot poll does not need re-arming.
+                // It stays active until explicitly removed or an error occurs.
+                // However, if the handler decided to stop polling (e.g. by setting polling=false),
+                // we should probably remove it? 
+                // Current implementation of remove is not trivial with multishot.
+                // We assume for now we keep polling.
+                // If we need to stop, we should use io_uring_prep_poll_remove.
+                
+                // Legacy re-arm logic removed.
             }
         } else {
             log_error("hevent shouldn't be null");
@@ -97,15 +114,47 @@ struct hvisor_event *add_event(int fd, int epoll_type,
     hevent->param = param;
     hevent->fd = fd;
     hevent->epoll_type = epoll_type;
+    hevent->polling = true;
 
+    pthread_mutex_lock(&ring_mutex);
     sqe = io_uring_get_sqe(&ring);
     io_uring_prep_poll_add(sqe, fd, epoll_type);
+    // Enable Multishot Poll
+    sqe->len |= IORING_POLL_ADD_MULTI;
     io_uring_sqe_set_data(sqe, hevent);
     io_uring_submit(&ring);
+    pthread_mutex_unlock(&ring_mutex);
 
     events[events_num] = hevent;
     events_num++;
     return hevent;
+}
+
+void enable_event_poll(struct hvisor_event *hevent) {
+    if (hevent->polling) {
+        return;
+    }
+    hevent->polling = true;
+    pthread_mutex_lock(&ring_mutex);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_poll_add(sqe, hevent->fd, hevent->epoll_type);
+    sqe->len |= IORING_POLL_ADD_MULTI;
+    io_uring_sqe_set_data(sqe, hevent);
+    io_uring_submit(&ring);
+    pthread_mutex_unlock(&ring_mutex);
+}
+
+void disable_event_poll(struct hvisor_event *hevent) {
+    if (!hevent->polling) {
+        return;
+    }
+    hevent->polling = false;
+    pthread_mutex_lock(&ring_mutex);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_poll_remove(sqe, (__u64)hevent);
+    io_uring_sqe_set_data(sqe, hevent); // Not strictly necessary for remove but good practice
+    io_uring_submit(&ring);
+    pthread_mutex_unlock(&ring_mutex);
 }
 
 // Create a thread monitoring events.
