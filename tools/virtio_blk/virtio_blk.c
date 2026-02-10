@@ -68,7 +68,6 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
     int n = req->iovcnt;
     
     struct io_uring *ring = get_global_ring();
-    pthread_mutex_t *ring_mutex = get_global_ring_mutex();
     struct io_uring_sqe *sqe;
 
     req->dev = dev;
@@ -76,7 +75,6 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
 
     switch (req->type) {
     case VIRTIO_BLK_T_IN:
-        pthread_mutex_lock(ring_mutex);
         sqe = io_uring_get_sqe(ring);
         req->hevent.completion_handler = virtio_blk_completion_handler;
         req->hevent.param = req;
@@ -84,10 +82,8 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
         io_uring_prep_readv(sqe, dev->img_fd, &iov[1], n - 2, req->offset);
         io_uring_sqe_set_data(sqe, &req->hevent);
         io_uring_submit(ring);
-        pthread_mutex_unlock(ring_mutex);
         break;
     case VIRTIO_BLK_T_OUT:
-        pthread_mutex_lock(ring_mutex);
         sqe = io_uring_get_sqe(ring);
         req->hevent.completion_handler = virtio_blk_completion_handler;
         req->hevent.param = req;
@@ -95,7 +91,6 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
         io_uring_prep_writev(sqe, dev->img_fd, &iov[1], n - 2, req->offset);
         io_uring_sqe_set_data(sqe, &req->hevent);
         io_uring_submit(ring);
-        pthread_mutex_unlock(ring_mutex);
         break;
     case VIRTIO_BLK_T_GET_ID: {
         char s[20] = "hvisor-virblk";
@@ -145,14 +140,9 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
     log_info("debug: virtio_blk_init: %s, size is %lld", img_path,
              dev->config.capacity);
     
-    // Init worker
-    dev->kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (dev->kick_fd < 0) {
-        log_error("eventfd failed");
-        return -1;
-    }
-    
-    add_event(dev->kick_fd, POLLIN, virtio_blk_kick_handler, vdev);
+    // In single-threaded model, we don't need kick_fd for self-notification
+    // We can call processing functions directly.
+    dev->kick_fd = -1;
     
     return 0;
 }
@@ -230,31 +220,20 @@ static void virtio_blk_process_queue(VirtIODevice *vdev, VirtQueue *vq) {
         virtqueue_enable_notify(vq);
     }
     
-    if (!virtqueue_is_empty(vq)) {
-        uint64_t val = 1;
-        write(blkDev->kick_fd, &val, sizeof(val));
-    }
-}
-
-static void virtio_blk_kick_handler(int fd, int type, void *param) {
-    VirtIODevice *vdev = (VirtIODevice *)param;
-    BlkDev *dev = (BlkDev *)vdev->dev;
-    uint64_t val;
-    read(fd, &val, sizeof(val));
-    virtio_blk_process_queue(vdev, &vdev->vqs[0]);
+    // In single-threaded model, we don't need to kick ourselves.
+    // If there are more requests, they will be processed in next iteration
+    // or by direct call if we loop here.
 }
 
 int virtio_blk_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
-    BlkDev *dev = (BlkDev *)vdev->dev;
-    uint64_t val = 1;
-    write(dev->kick_fd, &val, sizeof(val));
+    virtio_blk_process_queue(vdev, vq);
     return 0;
 }
 
 void virtio_blk_close(VirtIODevice *vdev) {
     BlkDev *dev = (BlkDev *)vdev->dev;
     close(dev->img_fd);
-    close(dev->kick_fd);
+    if (dev->kick_fd >= 0) close(dev->kick_fd);
     free(dev);
     free(vdev->vqs);
     free(vdev);
