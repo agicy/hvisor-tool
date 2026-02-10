@@ -18,6 +18,11 @@
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <liburing.h>
+#include <sys/eventfd.h>
+#include <pthread.h>
+#include "event_monitor.h"
+
+static void virtio_blk_completion_handler(void *param, int res);
 
 static void complete_block_operation(BlkDev *dev, struct blkp_req *req,
                                      VirtQueue *vq, int err,
@@ -62,7 +67,7 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
     struct iovec *iov = req->iov;
     int n = req->iovcnt;
     
-    struct io_uring *ring = get_global_ring();
+    struct io_uring *ring = &dev->ring;
     struct io_uring_sqe *sqe;
 
     req->dev = dev;
@@ -134,6 +139,33 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
     vdev->virtio_close = virtio_blk_close;
     log_info("debug: virtio_blk_init: %s, size is %lld", img_path,
              dev->config.capacity);
+    
+    // Init worker
+    dev->kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (dev->kick_fd < 0) {
+        log_error("eventfd failed");
+        return -1;
+    }
+    
+    int ret = io_uring_queue_init(32, &dev->ring, 0);
+    if (ret < 0) {
+        log_error("io_uring_queue_init failed");
+        return -1;
+    }
+    
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
+    struct hvisor_event *kick_event = calloc(1, sizeof(struct hvisor_event));
+    kick_event->fd = dev->kick_fd;
+    kick_event->epoll_type = POLLIN;
+    kick_event->handler = virtio_blk_kick_handler;
+    kick_event->param = vdev;
+    
+    io_uring_prep_poll_add(sqe, dev->kick_fd, POLLIN);
+    io_uring_sqe_set_data(sqe, kick_event);
+    io_uring_submit(&dev->ring);
+    
+    pthread_create(&dev->worker_tid, NULL, virtio_blk_worker, vdev);
+
     return 0;
 }
 
@@ -194,32 +226,74 @@ err_out:
     return NULL;
 }
 
-int virtio_blk_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
-    log_debug("virtio blk notify handler enter");
+static void virtio_blk_process_queue(VirtIODevice *vdev, VirtQueue *vq) {
     BlkDev *blkDev = (BlkDev *)vdev->dev;
     struct blkp_req *breq;
-    TAILQ_HEAD(, blkp_req) procq;
-    TAILQ_INIT(&procq);
+    
     while (!virtqueue_is_empty(vq)) {
         virtqueue_disable_notify(vq);
         while (!virtqueue_is_empty(vq)) {
             breq = virtq_blk_handle_one_request(vq);
-            TAILQ_INSERT_TAIL(&procq, breq, link);
+            if (breq)
+                 blkproc(blkDev, breq, vq);
         }
         virtqueue_enable_notify(vq);
     }
-    if (TAILQ_EMPTY(&procq)) {
-        log_debug("virtio blk notify handler exit, procq is empty");
-        return 0;
+}
+
+static void virtio_blk_kick_handler(int fd, int type, void *param) {
+    VirtIODevice *vdev = (VirtIODevice *)param;
+    BlkDev *dev = (BlkDev *)vdev->dev;
+    uint64_t val;
+    read(fd, &val, sizeof(val));
+    virtio_blk_process_queue(vdev, &vdev->vqs[0]);
+}
+
+static void *virtio_blk_worker(void *arg) {
+    VirtIODevice *vdev = (VirtIODevice *)arg;
+    BlkDev *dev = (BlkDev *)vdev->dev;
+    struct io_uring_cqe *cqe;
+    struct hvisor_event *hevent;
+    int ret;
+
+    while (!dev->stop) {
+        ret = io_uring_submit_and_wait(&dev->ring, 1);
+        if (ret < 0) {
+            if (ret != -EINTR)
+                log_error("io_uring_submit_and_wait failed: %d", ret);
+            continue;
+        }
+
+        struct io_uring_cqe *cqes[16];
+        int count = io_uring_peek_batch_cqe(&dev->ring, cqes, 16);
+        
+        for (int i = 0; i < count; i++) {
+            cqe = cqes[i];
+            hevent = io_uring_cqe_get_data(cqe);
+            
+            if (hevent) {
+                if (hevent->handler) { // POLL event (kick_fd)
+                     hevent->handler(hevent->fd, hevent->epoll_type, hevent->param);
+                     
+                     // Re-arm poll
+                     struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
+                     io_uring_prep_poll_add(sqe, dev->kick_fd, POLLIN);
+                     io_uring_sqe_set_data(sqe, hevent);
+                     io_uring_submit(&dev->ring);
+                } else if (hevent->completion_handler) { // I/O completion
+                    hevent->completion_handler(hevent->param, cqe->res);
+                }
+            }
+            io_uring_cqe_seen(&dev->ring, cqe);
+        }
     }
-    
-    // Process requests directly in the same thread (event monitor thread)
-    while (!TAILQ_EMPTY(&procq)) {
-        breq = TAILQ_FIRST(&procq);
-        TAILQ_REMOVE(&procq, breq, link);
-        blkproc(blkDev, breq, vq);
-    }
-    
+    return NULL;
+}
+
+int virtio_blk_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
+    BlkDev *dev = (BlkDev *)vdev->dev;
+    uint64_t val = 1;
+    write(dev->kick_fd, &val, sizeof(val));
     return 0;
 }
 

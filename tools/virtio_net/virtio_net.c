@@ -22,6 +22,10 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include <poll.h>
+#include <sys/eventfd.h>
+#include <pthread.h>
+#include <liburing.h>
+
 // The max bytes of a packet in data link layer is 1518 bytes.
 static uint8_t trashbuf[1600];
 
@@ -64,16 +68,84 @@ static int open_tap(char *devname) {
     return tunfd;
 }
 
-/// When driver notifies rxq, it means the rx process can now begin
-int virtio_net_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
-    log_debug("virtio_net_rxq_notify_handler");
+void virtio_net_rxq_process(VirtIODevice *vdev, VirtQueue *vq) {
+    // Current virtio_net_event_handler logic but called from worker
+    // Re-use virtio_net_event_handler code but fix args
     NetDev *net = vdev->dev;
-    if (net->rx_ready <= 0) {
-        net->rx_ready = 1;
-        // When buffers are all used, virtio_net_event_handler will notify the
-        // driver.
+    virtio_net_event_handler(net->tapfd, POLLIN, vdev);
+}
+
+void virtio_net_txq_process(VirtIODevice *vdev, VirtQueue *vq) {
+    // TX Logic
+    while (!virtqueue_is_empty(vq)) {
         virtqueue_disable_notify(vq);
+        while (!virtqueue_is_empty(vq)) {
+            virtq_tx_handle_one_request(vdev, vq);
+        }
+        virtqueue_enable_notify(vq);
     }
+}
+
+static void *virtio_net_worker(void *arg) {
+    VirtIODevice *vdev = (VirtIODevice *)arg;
+    NetDev *dev = (NetDev *)vdev->dev;
+    struct io_uring_cqe *cqe;
+    struct hvisor_event *hevent;
+    int ret;
+    uint64_t val;
+
+    while (!dev->stop) {
+        ret = io_uring_submit_and_wait(&dev->ring, 1);
+        if (ret < 0) {
+            if (ret != -EINTR) log_error("io_uring wait error: %d", ret);
+            continue;
+        }
+
+        struct io_uring_cqe *cqes[16];
+        int count = io_uring_peek_batch_cqe(&dev->ring, cqes, 16);
+        
+        for (int i = 0; i < count; i++) {
+            cqe = cqes[i];
+            hevent = io_uring_cqe_get_data(cqe);
+            
+            if (hevent) {
+                if (hevent->handler == (void*)1) { // Kick Event
+                     read(dev->kick_fd, &val, sizeof(val));
+                     // Process TX
+                     virtio_net_txq_process(vdev, &vdev->vqs[NET_QUEUE_TX]);
+                     // Process RX (if buffers added)
+                     virtio_net_rxq_process(vdev, &vdev->vqs[NET_QUEUE_RX]);
+                     
+                     struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
+                     io_uring_prep_poll_add(sqe, dev->kick_fd, POLLIN);
+                     io_uring_sqe_set_data(sqe, hevent);
+                     io_uring_submit(&dev->ring);
+                } else if (hevent->handler == (void*)2) { // TAP Event
+                     virtio_net_rxq_process(vdev, &vdev->vqs[NET_QUEUE_RX]);
+                     
+                     struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
+                     io_uring_prep_poll_add(sqe, dev->tapfd, POLLIN);
+                     io_uring_sqe_set_data(sqe, hevent);
+                     io_uring_submit(&dev->ring);
+                }
+            }
+            io_uring_cqe_seen(&dev->ring, cqe);
+        }
+    }
+    return NULL;
+}
+
+int virtio_net_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
+    NetDev *dev = (NetDev *)vdev->dev;
+    uint64_t val = 1;
+    write(dev->kick_fd, &val, sizeof(val));
+    return 0;
+}
+
+int virtio_net_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
+    NetDev *dev = (NetDev *)vdev->dev;
+    uint64_t val = 1;
+    write(dev->kick_fd, &val, sizeof(val));
     return 0;
 }
 /// remove the header in iov, return the new iov. the new iov num is in niov.
@@ -227,29 +299,49 @@ int virtio_net_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     return 0;
 }
 
-int virtio_net_init(VirtIODevice *vdev, char *devname) {
-    log_info("virtio net init");
-    NetDev *net = vdev->dev;
-    // open tap device
-    net->tapfd = open_tap(devname);
-    if (net->tapfd == -1) {
-        log_error("open tap device failed");
+static void *virtio_net_worker(void *arg);
+
+int virtio_net_init(VirtIODevice *vdev) {
+    uint8_t mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+    char devname[IFNAMSIZ];
+    NetDev *dev = init_net_dev(mac);
+    vdev->dev = dev;
+    snprintf(devname, sizeof(devname), "tap%d", vdev->zone_id);
+    dev->tapfd = open_tap(devname);
+    if (dev->tapfd < 0) {
+        log_error("failed to open tap device");
         return -1;
     }
-    // set tap device O_NONBLOCK. If io operation like readv blocks, then return
-    // errno EWOULDBLOCK
-    if (set_nonblocking(net->tapfd) < 0) {
-        close(net->tapfd);
-        net->tapfd = -1;
-    }
-    // register an epoll read event for tap device
-    net->event = add_event(net->tapfd, POLLIN, virtio_net_event_handler, vdev);
-    if (net->event == NULL) {
-        log_error("Can't register net event");
-        close(net->tapfd);
-        net->tapfd = -1;
-        return -1;
-    }
+    set_nonblocking(dev->tapfd);
+
+    // Init worker
+    dev->kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    io_uring_queue_init(32, &dev->ring, 0);
+
+    // Add kick_fd poll
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
+    struct hvisor_event *kick_event = calloc(1, sizeof(struct hvisor_event));
+    kick_event->fd = dev->kick_fd;
+    kick_event->epoll_type = POLLIN;
+    kick_event->handler = (void*)1; // Marker
+    kick_event->param = vdev;
+    io_uring_prep_poll_add(sqe, dev->kick_fd, POLLIN);
+    io_uring_sqe_set_data(sqe, kick_event);
+    io_uring_submit(&dev->ring);
+
+    // Add tap_fd poll
+    sqe = io_uring_get_sqe(&dev->ring);
+    struct hvisor_event *tap_event = calloc(1, sizeof(struct hvisor_event));
+    tap_event->fd = dev->tapfd;
+    tap_event->epoll_type = POLLIN;
+    tap_event->handler = (void*)2; // Marker
+    tap_event->param = vdev;
+    io_uring_prep_poll_add(sqe, dev->tapfd, POLLIN);
+    io_uring_sqe_set_data(sqe, tap_event);
+    io_uring_submit(&dev->ring);
+
+    pthread_create(&dev->worker_tid, NULL, virtio_net_worker, vdev);
+
     vdev->virtio_close = virtio_net_close;
     return 0;
 }

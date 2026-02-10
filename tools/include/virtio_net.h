@@ -36,6 +36,12 @@ typedef struct virtio_net_dev {
     int tapfd;
     int rx_ready;
     struct hvisor_event *event;
+    
+    // Worker related
+    pthread_t worker_tid;
+    struct io_uring ring;
+    int kick_fd;
+    bool stop;
 } NetDev;
 
 NetDev *init_net_dev(uint8_t mac[]);

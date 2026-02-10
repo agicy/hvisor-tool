@@ -21,6 +21,9 @@
 #include <sys/time.h>
 #include <termios.h>
 #include <poll.h>
+#include <sys/eventfd.h>
+#include <pthread.h>
+#include <liburing.h>
 
 static uint8_t trashbuf[1024];
 
@@ -124,27 +127,105 @@ int virtio_console_init(VirtIODevice *vdev) {
         log_error("Failed to set nonblocking mode, fd closed!");
     }
 
-    dev->event =
-        add_event(dev->master_fd, POLLIN, virtio_console_event_handler, vdev);
+    // Init worker
+    dev->kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    io_uring_queue_init(32, &dev->ring, 0);
 
-    if (dev->event == NULL) {
-        log_error("Can't register console event");
-        close(master_fd);
-        dev->master_fd = -1;
-        return -1;
-    }
+    // Add kick_fd poll
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
+    struct hvisor_event *kick_event = calloc(1, sizeof(struct hvisor_event));
+    kick_event->fd = dev->kick_fd;
+    kick_event->epoll_type = POLLIN;
+    kick_event->handler = (void*)1; // Marker
+    kick_event->param = vdev;
+    io_uring_prep_poll_add(sqe, dev->kick_fd, POLLIN);
+    io_uring_sqe_set_data(sqe, kick_event);
+    io_uring_submit(&dev->ring);
+
+    // Add master_fd poll
+    sqe = io_uring_get_sqe(&dev->ring);
+    struct hvisor_event *master_event = calloc(1, sizeof(struct hvisor_event));
+    master_event->fd = dev->master_fd;
+    master_event->epoll_type = POLLIN;
+    master_event->handler = (void*)2; // Marker
+    master_event->param = vdev;
+    io_uring_prep_poll_add(sqe, dev->master_fd, POLLIN);
+    io_uring_sqe_set_data(sqe, master_event);
+    io_uring_submit(&dev->ring);
+
+    pthread_create(&dev->worker_tid, NULL, virtio_console_worker, vdev);
 
     vdev->virtio_close = virtio_console_close;
     return 0;
 }
 
+static void virtio_console_rxq_process(VirtIODevice *vdev, VirtQueue *vq) {
+    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
+    virtio_console_event_handler(dev->master_fd, POLLIN, vdev);
+}
+
+static void virtio_console_txq_process(VirtIODevice *vdev, VirtQueue *vq) {
+    while (!virtqueue_is_empty(vq)) {
+        virtqueue_disable_notify(vq);
+        while (!virtqueue_is_empty(vq)) {
+            virtq_tx_handle_one_request(vdev->dev, vq);
+        }
+        virtqueue_enable_notify(vq);
+    }
+}
+
+static void *virtio_console_worker(void *arg) {
+    VirtIODevice *vdev = (VirtIODevice *)arg;
+    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
+    struct io_uring_cqe *cqe;
+    struct hvisor_event *hevent;
+    int ret;
+    uint64_t val;
+
+    while (!dev->stop) {
+        ret = io_uring_submit_and_wait(&dev->ring, 1);
+        if (ret < 0) {
+            if (ret != -EINTR) log_error("io_uring wait error: %d", ret);
+            continue;
+        }
+
+        struct io_uring_cqe *cqes[16];
+        int count = io_uring_peek_batch_cqe(&dev->ring, cqes, 16);
+        
+        for (int i = 0; i < count; i++) {
+            cqe = cqes[i];
+            hevent = io_uring_cqe_get_data(cqe);
+            
+            if (hevent) {
+                if (hevent->handler == (void*)1) { // Kick Event
+                     read(dev->kick_fd, &val, sizeof(val));
+                     virtio_console_txq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_TX]);
+                     virtio_console_rxq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_RX]);
+                     
+                     struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
+                     io_uring_prep_poll_add(sqe, dev->kick_fd, POLLIN);
+                     io_uring_sqe_set_data(sqe, hevent);
+                     io_uring_submit(&dev->ring);
+                } else if (hevent->handler == (void*)2) { // Master FD Event
+                     virtio_console_rxq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_RX]);
+                     
+                     struct io_uring_sqe *sqe = io_uring_get_sqe(&dev->ring);
+                     io_uring_prep_poll_add(sqe, dev->master_fd, POLLIN);
+                     io_uring_sqe_set_data(sqe, hevent);
+                     io_uring_submit(&dev->ring);
+                }
+            }
+            io_uring_cqe_seen(&dev->ring, cqe);
+        }
+    }
+    return NULL;
+}
+
 int virtio_console_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     log_debug("%s", __func__);
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
-    if (dev->rx_ready <= 0) {
-        dev->rx_ready = 1;
-        virtqueue_disable_notify(vq);
-    }
+    uint64_t val = 1;
+    write(dev->kick_fd, &val, sizeof(val));
     return 0;
 }
 
@@ -174,14 +255,9 @@ static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
 
 int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     log_debug("%s", __func__);
-    while (!virtqueue_is_empty(vq)) {
-        virtqueue_disable_notify(vq);
-        while (!virtqueue_is_empty(vq)) {
-            virtq_tx_handle_one_request(vdev->dev, vq);
-        }
-        virtqueue_enable_notify(vq);
-    }
-    virtio_inject_irq(vq);
+    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
+    uint64_t val = 1;
+    write(dev->kick_fd, &val, sizeof(val));
     return 0;
 }
 

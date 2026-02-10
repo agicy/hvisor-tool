@@ -27,6 +27,13 @@ typedef struct virtio_console_dev {
     int master_fd;
     int rx_ready;
     struct hvisor_event *event;
+    struct termios old_termios;
+    
+    // Worker related
+    pthread_t worker_tid;
+    struct io_uring ring;
+    int kick_fd;
+    bool stop;
 } ConsoleDev;
 
 ConsoleDev *init_console_dev();
