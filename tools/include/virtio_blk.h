@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/queue.h>
+#include <liburing.h>
 
 /// Maximum number of segments in a request.
 #define BLK_SEG_MAX 512
@@ -50,6 +51,7 @@ typedef struct virtio_blk_dev {
     pthread_cond_t cond;
     TAILQ_HEAD(, blkp_req) procq;
     int close;
+    struct io_uring ring;
 } BlkDev;
 
 BlkDev *init_blk_dev(VirtIODevice *vdev);

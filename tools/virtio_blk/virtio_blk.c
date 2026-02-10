@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
+#include <liburing.h>
 
 static void complete_block_operation(BlkDev *dev, struct blkp_req *req,
                                      VirtQueue *vq, int err,
@@ -58,9 +59,17 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
     int n = req->iovcnt, err = 0;
     ssize_t len, written_len = 0;
 
+    struct io_uring_sqe *sqe;
+    struct io_uring_cqe *cqe;
+
     switch (req->type) {
     case VIRTIO_BLK_T_IN:
-        written_len = len = preadv(dev->img_fd, &iov[1], n - 2, req->offset);
+        sqe = io_uring_get_sqe(&dev->ring);
+        io_uring_prep_readv(sqe, dev->img_fd, &iov[1], n - 2, req->offset);
+        io_uring_submit(&dev->ring);
+        io_uring_wait_cqe(&dev->ring, &cqe);
+        written_len = len = cqe->res;
+        io_uring_cqe_seen(&dev->ring, cqe);
         // log_debug("readv data is ");
         // for(int i = 1; i < n-1; i++) {
         //     log_debug("n-1 is %d, iov[i].iov_len is %d", n-1,
@@ -71,15 +80,20 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
         log_debug("preadv, len is %d, offset is %d", len, req->offset);
         if (len < 0) {
             log_error("pread failed");
-            err = errno;
+            err = -len;
         }
         break;
     case VIRTIO_BLK_T_OUT:
-        len = pwritev(dev->img_fd, &iov[1], n - 2, req->offset);
+        sqe = io_uring_get_sqe(&dev->ring);
+        io_uring_prep_writev(sqe, dev->img_fd, &iov[1], n - 2, req->offset);
+        io_uring_submit(&dev->ring);
+        io_uring_wait_cqe(&dev->ring, &cqe);
+        len = cqe->res;
+        io_uring_cqe_seen(&dev->ring, cqe);
         log_debug("pwritev, len is %d, offset is %d", len, req->offset);
         if (len < 0) {
             log_error("pwrite failed");
-            err = errno;
+            err = -len;
         }
         break;
     case VIRTIO_BLK_T_GET_ID: {
@@ -134,6 +148,7 @@ BlkDev *init_blk_dev(VirtIODevice *vdev) {
     pthread_mutex_init(&dev->mtx, NULL);
     pthread_cond_init(&dev->cond, NULL);
     TAILQ_INIT(&dev->procq);
+    io_uring_queue_init(16, &dev->ring, 0);
     pthread_create(&dev->tid, NULL, blkproc_thread, vdev);
     return dev;
 }
@@ -254,6 +269,7 @@ void virtio_blk_close(VirtIODevice *vdev) {
     pthread_join(dev->tid, NULL);
     pthread_mutex_destroy(&dev->mtx);
     pthread_cond_destroy(&dev->cond);
+    io_uring_queue_exit(&dev->ring);
     close(dev->img_fd);
     free(dev);
     free(vdev->vqs);
