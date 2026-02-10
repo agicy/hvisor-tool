@@ -32,8 +32,8 @@ static uint8_t trashbuf[1024];
 /// @return Pointer to the initialized ConsoleDev structure.
 ConsoleDev *init_console_dev() {
     ConsoleDev *dev = (ConsoleDev *)malloc(sizeof(ConsoleDev));
-    dev->config.cols = 80;
-    dev->config.rows = 25;
+    dev->config.cols = CONSOLE_DEFAULT_COLS;
+    dev->config.rows = CONSOLE_DEFAULT_ROWS;
     dev->master_fd = -1;
     dev->rx_ready = -1;
     dev->event = NULL;
@@ -114,8 +114,9 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
             sqe = io_uring_get_sqe(ring);
             if (!sqe) {
                 log_error("io_uring ring full, dropping RX request");
-                // Restore request for later retry? 
-                // Or just drop. Since we set pending_rx_req=NULL, we might lose it if we don't restore.
+                // Restore request for later retry?
+                // Or just drop. Since we set pending_rx_req=NULL, we might lose
+                // it if we don't restore.
                 dev->pending_rx_req = req;
                 return;
             }
@@ -180,10 +181,10 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
         io_uring_submit(ring);
         sqe = io_uring_get_sqe(ring);
         if (!sqe) {
-             log_error("io_uring ring full, dropping RX request");
-             free(req->iov);
-             free(req);
-             return;
+            log_error("io_uring ring full, dropping RX request");
+            free(req->iov);
+            free(req);
+            return;
         }
     }
     io_uring_prep_readv(sqe, dev->master_fd, req->iov, req->iovcnt, 0);
@@ -338,16 +339,16 @@ static int virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
 
     struct io_uring *ring = get_global_ring();
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    
+
     if (!sqe) {
         // Try to clear some space
         io_uring_submit(ring);
         sqe = io_uring_get_sqe(ring);
         if (!sqe) {
-             log_error("io_uring ring full, dropping TX packet");
-             free(req->iov);
-             free(req);
-             return -1;
+            log_error("io_uring ring full, dropping TX packet");
+            free(req->iov);
+            free(req);
+            return -1;
         }
     }
 

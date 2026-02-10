@@ -21,6 +21,9 @@
 #define CONSOLE_QUEUE_RX 0
 #define CONSOLE_QUEUE_TX 1
 
+#define CONSOLE_DEFAULT_COLS 80
+#define CONSOLE_DEFAULT_ROWS 25
+
 typedef struct virtio_console_config ConsoleConfig;
 typedef struct virtio_console_dev {
     ConsoleConfig config;
