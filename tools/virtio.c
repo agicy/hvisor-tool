@@ -18,12 +18,14 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+#include <xf86drm.h>
 
 #include "hvisor.h"
 #include "log.h"
