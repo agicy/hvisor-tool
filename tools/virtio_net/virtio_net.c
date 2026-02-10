@@ -21,6 +21,7 @@
 #include <sys/ioctl.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <poll.h>
 // The max bytes of a packet in data link layer is 1518 bytes.
 static uint8_t trashbuf[1600];
 
@@ -116,7 +117,7 @@ void virtio_net_event_handler(int fd, int epoll_type, void *param) {
     int n, len;
     uint16_t idx;
     size_t header_len = get_nethdr_size(vdev);
-    if (fd != net->tapfd || epoll_type != EPOLLIN) {
+    if (fd != net->tapfd || epoll_type != POLLIN) {
         log_error("invalid event");
         return;
     }
@@ -242,7 +243,7 @@ int virtio_net_init(VirtIODevice *vdev, char *devname) {
         net->tapfd = -1;
     }
     // register an epoll read event for tap device
-    net->event = add_event(net->tapfd, EPOLLIN, virtio_net_event_handler, vdev);
+    net->event = add_event(net->tapfd, POLLIN, virtio_net_event_handler, vdev);
     if (net->event == NULL) {
         log_error("Can't register net event");
         close(net->tapfd);
