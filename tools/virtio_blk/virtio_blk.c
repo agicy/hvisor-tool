@@ -11,6 +11,7 @@
 #include "virtio_blk.h"
 #include "log.h"
 #include "virtio.h"
+#include "event_monitor.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -19,121 +20,44 @@
 #include <sys/stat.h>
 #include <liburing.h>
 
-static void complete_block_operation(BlkDev *dev, struct blkp_req *req,
-                                     VirtQueue *vq, int err,
-                                     ssize_t written_len) {
+static void complete_block_operation(int res, void *param) {
+    struct blkp_req *req = (struct blkp_req *)param;
+    BlkDev *dev = req->dev;
+    VirtQueue *vq = req->vq;
+    
+    // res is the result of readv/writev (bytes read/written or -errno)
+    ssize_t written_len = 0;
+    int err = 0;
+
+    if (res < 0) {
+        err = -res;
+    } else {
+        written_len = res;
+    }
+
     uint8_t *vstatus = (uint8_t *)(req->iov[req->iovcnt - 1].iov_base);
-    int is_empty = 0;
     if (err == EOPNOTSUPP)
         *vstatus = VIRTIO_BLK_S_UNSUPP;
     else if (err != 0)
         *vstatus = VIRTIO_BLK_S_IOERR;
     else
         *vstatus = VIRTIO_BLK_S_OK;
+
     if (err != 0) {
         log_error("virt blk err, num is %d", err);
     }
+    
     update_used_ring(vq, req->idx, written_len + 1);
-    pthread_mutex_lock(&dev->mtx);
-    is_empty = TAILQ_EMPTY(&dev->procq);
-    pthread_mutex_unlock(&dev->mtx);
-    if (is_empty)
-        virtio_inject_irq(vq);
+    virtio_inject_irq(vq);
+
     free(req->iov);
     free(req);
 }
-// get a blk req from procq
-static int get_breq(BlkDev *dev, struct blkp_req **req) {
-    struct blkp_req *elem;
-    elem = TAILQ_FIRST(&dev->procq);
-    if (elem == NULL) {
-        return 0;
-    }
-    TAILQ_REMOVE(&dev->procq, elem, link);
-    *req = elem;
-    return 1;
-}
 
-static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
-    struct iovec *iov = req->iov;
-    int n = req->iovcnt, err = 0;
-    ssize_t len, written_len = 0;
-
-    struct io_uring_sqe *sqe;
-    struct io_uring_cqe *cqe;
-
-    switch (req->type) {
-    case VIRTIO_BLK_T_IN:
-        sqe = io_uring_get_sqe(&dev->ring);
-        io_uring_prep_readv(sqe, dev->img_fd, &iov[1], n - 2, req->offset);
-        io_uring_submit(&dev->ring);
-        io_uring_wait_cqe(&dev->ring, &cqe);
-        written_len = len = cqe->res;
-        io_uring_cqe_seen(&dev->ring, cqe);
-        // log_debug("readv data is ");
-        // for(int i = 1; i < n-1; i++) {
-        //     log_debug("n-1 is %d, iov[i].iov_len is %d", n-1,
-        //     iov[i].iov_len); for (int j = 0; j < iov[i].iov_len; j++)
-        //         printf("%x", *(int*)(iov[i].iov_base + j));
-        //     printf("\n");
-        // }
-        log_debug("preadv, len is %d, offset is %d", len, req->offset);
-        if (len < 0) {
-            log_error("pread failed");
-            err = -len;
-        }
-        break;
-    case VIRTIO_BLK_T_OUT:
-        sqe = io_uring_get_sqe(&dev->ring);
-        io_uring_prep_writev(sqe, dev->img_fd, &iov[1], n - 2, req->offset);
-        io_uring_submit(&dev->ring);
-        io_uring_wait_cqe(&dev->ring, &cqe);
-        len = cqe->res;
-        io_uring_cqe_seen(&dev->ring, cqe);
-        log_debug("pwritev, len is %d, offset is %d", len, req->offset);
-        if (len < 0) {
-            log_error("pwrite failed");
-            err = -len;
-        }
-        break;
-    case VIRTIO_BLK_T_GET_ID: {
-        char s[20] = "hvisor-virblk";
-        strncpy(iov[1].iov_base, s, MIN(sizeof(s), iov[1].iov_len));
-        break;
-    }
-    default:
-        log_fatal("Operation is not supported");
-        err = EOPNOTSUPP;
-        break;
-    }
-    complete_block_operation(dev, req, vq, err, written_len);
-}
-
-// Every virtio-blk has a blkproc_thread that is used for reading and writing.
-static void *blkproc_thread(void *arg) {
-    VirtIODevice *vdev = arg;
-    BlkDev *dev = vdev->dev;
-    struct blkp_req *breq;
-    // get_breq will access the critical section, so lock it.
-    pthread_mutex_lock(&dev->mtx);
-
-    for (;;) {
-        while (get_breq(dev, &breq)) {
-            // blk_proc don't access the critical section, so unlock.
-            pthread_mutex_unlock(&dev->mtx);
-            blkproc(dev, breq, vdev->vqs);
-            pthread_mutex_lock(&dev->mtx);
-        }
-
-        if (dev->close) {
-            pthread_mutex_unlock(&dev->mtx);
-            break;
-        }
-        pthread_cond_wait(&dev->cond, &dev->mtx);
-    }
-    pthread_exit(NULL);
-    return NULL;
-}
+// Remove unused functions
+// get_breq
+// blkproc
+// blkproc_thread
 
 // create blk dev.
 BlkDev *init_blk_dev(VirtIODevice *vdev) {
@@ -143,13 +67,6 @@ BlkDev *init_blk_dev(VirtIODevice *vdev) {
     dev->config.size_max = -1;
     dev->config.seg_max = BLK_SEG_MAX;
     dev->img_fd = -1;
-    dev->close = 0;
-    // TODO: chang to thread poll
-    pthread_mutex_init(&dev->mtx, NULL);
-    pthread_cond_init(&dev->cond, NULL);
-    TAILQ_INIT(&dev->procq);
-    io_uring_queue_init(16, &dev->ring, 0);
-    pthread_create(&dev->tid, NULL, blkproc_thread, vdev);
     return dev;
 }
 
@@ -179,8 +96,8 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
 }
 
 // handle one descriptor list
-static struct blkp_req *virtq_blk_handle_one_request(VirtQueue *vq) {
-    log_debug("virtq_blk_handle_one_request enter");
+static struct blkp_req *virtq_blk_handle_one_request(VirtIODevice *vdev, VirtQueue *vq) {
+    // log_debug("virtq_blk_handle_one_request enter");
     struct blkp_req *breq;
     struct iovec *iov = NULL;
     uint16_t *flags;
@@ -217,6 +134,8 @@ static struct blkp_req *virtq_blk_handle_one_request(VirtQueue *vq) {
     breq->type = hdr->type;
     breq->iovcnt = n;
     breq->offset = offset;
+    breq->dev = vdev->dev;
+    breq->vq = vq;
 
     for (i = 1; i < n - 1; i++)
         if (((flags[i] & VRING_DESC_F_WRITE) == 0) !=
@@ -239,37 +158,67 @@ int virtio_blk_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     log_debug("virtio blk notify handler enter");
     BlkDev *blkDev = (BlkDev *)vdev->dev;
     struct blkp_req *breq;
-    TAILQ_HEAD(, blkp_req) procq;
-    TAILQ_INIT(&procq);
+
     while (!virtqueue_is_empty(vq)) {
         virtqueue_disable_notify(vq);
         while (!virtqueue_is_empty(vq)) {
-            breq = virtq_blk_handle_one_request(vq);
-            TAILQ_INSERT_TAIL(&procq, breq, link);
+            breq = virtq_blk_handle_one_request(vdev, vq);
+            if (!breq) continue;
+
+            // Submit async IO request
+            struct io_uring_sqe *sqe;
+            struct hvisor_event *hevent = calloc(1, sizeof(struct hvisor_event));
+            hevent->handler = (void (*)(int, int, void *))complete_block_operation;
+            hevent->param = breq;
+            hevent->type = EVENT_IO_ONESHOT;
+
+            event_monitor_lock();
+            struct io_uring *ring = event_monitor_get_ring();
+            sqe = io_uring_get_sqe(ring);
+            
+            if (!sqe) {
+                log_error("ring full, dropping request");
+                // TODO: handle ring full gracefully (maybe wait or queue locally)
+                event_monitor_unlock();
+                free(hevent);
+                continue;
+            }
+
+            switch (breq->type) {
+            case VIRTIO_BLK_T_IN:
+                io_uring_prep_readv(sqe, blkDev->img_fd, &breq->iov[1], breq->iovcnt - 2, breq->offset);
+                break;
+            case VIRTIO_BLK_T_OUT:
+                io_uring_prep_writev(sqe, blkDev->img_fd, &breq->iov[1], breq->iovcnt - 2, breq->offset);
+                break;
+            default:
+                // For GET_ID or others, we might just handle it synchronously or use a dummy event
+                // Current implementation only supports IN/OUT effectively via io_uring
+                // GET_ID was handled synchronously in old code
+                // Let's handle GET_ID synchronously here for now
+                if (breq->type == VIRTIO_BLK_T_GET_ID) {
+                     char s[20] = "hvisor-virblk";
+                     strncpy(breq->iov[1].iov_base, s, MIN(sizeof(s), breq->iov[1].iov_len));
+                     // Don't submit, just complete
+                     event_monitor_unlock();
+                     complete_block_operation(0, breq);
+                     free(hevent);
+                     continue;
+                }
+                break;
+            }
+
+            io_uring_sqe_set_data(sqe, hevent);
+            io_uring_submit(ring);
+            event_monitor_unlock();
         }
         virtqueue_enable_notify(vq);
     }
-    if (TAILQ_EMPTY(&procq)) {
-        log_debug("virtio blk notify handler exit, procq is empty");
-        return 0;
-    }
-    pthread_mutex_lock(&blkDev->mtx);
-    TAILQ_CONCAT(&blkDev->procq, &procq, link);
-    pthread_cond_signal(&blkDev->cond);
-    pthread_mutex_unlock(&blkDev->mtx);
     return 0;
 }
 
 void virtio_blk_close(VirtIODevice *vdev) {
     BlkDev *dev = vdev->dev;
-    pthread_mutex_lock(&dev->mtx);
-    dev->close = 1;
-    pthread_cond_signal(&dev->cond);
-    pthread_mutex_unlock(&dev->mtx);
-    pthread_join(dev->tid, NULL);
-    pthread_mutex_destroy(&dev->mtx);
-    pthread_cond_destroy(&dev->cond);
-    io_uring_queue_exit(&dev->ring);
     close(dev->img_fd);
     free(dev);
     free(vdev->vqs);

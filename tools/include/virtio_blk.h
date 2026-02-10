@@ -34,24 +34,18 @@ typedef struct virtio_blk_outhdr BlkReqHead;
 
 // A request needed to process by blk thread.
 struct blkp_req {
-    TAILQ_ENTRY(blkp_req) link;
     struct iovec *iov;
     int iovcnt;
     uint64_t offset;
     uint32_t type;
     uint16_t idx;
+    struct virtio_blk_dev *dev; // Add back pointer to dev for callback
+    VirtQueue *vq; // Need VQ for completion
 };
 
 typedef struct virtio_blk_dev {
     BlkConfig config;
     int img_fd;
-    // describe the worker thread that executes read, write and ioctl.
-    pthread_t tid;
-    pthread_mutex_t mtx;
-    pthread_cond_t cond;
-    TAILQ_HEAD(, blkp_req) procq;
-    int close;
-    struct io_uring ring;
 } BlkDev;
 
 BlkDev *init_blk_dev(VirtIODevice *vdev);
