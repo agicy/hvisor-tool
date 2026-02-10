@@ -142,22 +142,6 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     io_uring_submit(ring);
 }
 
-/// @brief Handler for kick events from the guest.
-/// @param fd The file descriptor associated with the kick event.
-/// @param epoll_type The type of event (e.g., POLLIN).
-/// @param param Pointer to the VirtIODevice structure.
-static void virtio_console_kick_handler(int fd, int epoll_type, void *param) {
-    // Legacy function, now unused in single-threaded mode.
-    // Kept for reference or if we ever revert to multi-threaded.
-    // In current model, we use direct calls.
-    VirtIODevice *vdev = (VirtIODevice *)param;
-    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
-    uint64_t val;
-    read(fd, &val, sizeof(val));
-    virtio_console_txq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_TX]);
-    virtio_console_rxq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_RX]);
-}
-
 /// @brief Initialize the virtio console device.
 /// @param vdev Pointer to the VirtIODevice structure.
 /// @return 0 on success, -1 on failure.
@@ -197,10 +181,6 @@ int virtio_console_init(VirtIODevice *vdev) {
         close(dev->master_fd);
         log_error("Failed to set nonblocking mode, fd closed!");
     }
-
-    // In single-threaded model, we don't need kick_fd for self-notification
-    // We can call processing functions directly.
-    dev->kick_fd = -1;
 
     // Register master_fd to event loop for RX (Host -> Guest)
     dev->event =
@@ -307,27 +287,12 @@ static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
     io_uring_submit(ring);
 }
 
-/// @brief Notify handler for the TX queue.
-/// @param vdev Pointer to the VirtIODevice structure.
-/// @param vq Pointer to the VirtQueue structure.
-/// @return 0 on success.
-int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
-    log_debug("%s", __func__);
-    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
-    uint64_t val = 1;
-    write(dev->kick_fd, &val, sizeof(val));
-    return 0;
-}
-
 /// @brief Close the virtio console device and release resources.
 /// @param vdev Pointer to the VirtIODevice structure.
 void virtio_console_close(VirtIODevice *vdev) {
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     if (dev->master_fd >= 0) {
         close(dev->master_fd);
-    }
-    if (dev->kick_fd >= 0) {
-        close(dev->kick_fd);
     }
     free(dev);
     free(vdev->vqs);

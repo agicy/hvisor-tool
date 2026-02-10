@@ -29,8 +29,6 @@ typedef struct virtio_console_dev {
     struct hvisor_event *event;
     struct termios old_termios;
     struct console_req *pending_rx_req;
-    
-    int kick_fd;
 } ConsoleDev;
 
 struct console_req {
