@@ -10,7 +10,7 @@
  */
 #ifndef HVISOR_EVENT_H
 #define HVISOR_EVENT_H
-#include <sys/epoll.h>
+#include <liburing.h>
 
 struct hvisor_event {
     void (*handler)(int, int, void *);
