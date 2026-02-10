@@ -42,7 +42,6 @@ int ko_fd;
 static int virtio_irq_fd = -1;
 volatile struct virtio_bridge *virtio_bridge;
 
-pthread_mutex_t RES_MUTEX = PTHREAD_MUTEX_INITIALIZER;
 VirtIODevice *vdevs[MAX_DEVS];
 int vdevs_num;
 
@@ -924,19 +923,18 @@ void virtio_inject_irq(VirtQueue *vq) {
     volatile struct device_res *res;
 
     // virtio_bridge is a global resource located in shared memory.
-    // Access to critical resources such as res_front and res_rear requires
-    // locking.
-
-    // Since the shared resources related to res_list are only accessed
-    //  at one specific code location, a lock before polling is_queue_full
-    //  is enough to ensure thread safety and performance.
-    pthread_mutex_lock(&RES_MUTEX);
+    // Since we are now running in a single-threaded reactor model (via io_uring),
+    // and the shared resources related to res_list are only accessed here
+    // in the event loop, we no longer need a mutex lock.
+    // The previous lock was to protect against concurrent access between
+    // main thread and signal thread, which are now merged.
 
     while (is_queue_full(virtio_bridge->res_front, virtio_bridge->res_rear,
                          MAX_REQ)) {
-        pthread_mutex_unlock(&RES_MUTEX);
+        // Simple busy wait or yield if queue is full. 
+        // In a single-threaded model, if we block here, we block everything.
+        // However, this queue is consumed by the hypervisor/kernel, so we wait for it to drain.
         usleep(10);
-        pthread_mutex_lock(&RES_MUTEX);
     }
     unsigned int res_rear = virtio_bridge->res_rear;
     res = &virtio_bridge->res_list[res_rear];
@@ -947,7 +945,7 @@ void virtio_inject_irq(VirtQueue *vq) {
     write_barrier();
     vq->dev->regs.interrupt_status = VIRTIO_MMIO_INT_VRING;
     vq->dev->regs.interrupt_count++;
-    pthread_mutex_unlock(&RES_MUTEX);
+
     log_debug("inject irq to device %s, vq is %d",
               virtio_device_type_to_string(vq->dev->type), vq->vq_idx);
     ioctl(ko_fd, HVISOR_FINISH_REQ);

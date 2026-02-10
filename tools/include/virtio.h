@@ -102,7 +102,6 @@ struct VirtQueue {
                                // the frontend driver of the backend processing
                                // progress Enabling this feature will change the
                                // flags field of the avail_ring
-    pthread_mutex_t used_ring_lock; // Used ring lock
 };
 
 // The highest abstruct representations of virtio device
