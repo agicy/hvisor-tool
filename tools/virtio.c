@@ -19,6 +19,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/eventfd.h>
+#include <sys/signalfd.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -38,6 +39,7 @@
 
 /// hvisor kernel module fd
 int ko_fd;
+static int virtio_irq_fd = -1;
 volatile struct virtio_bridge *virtio_bridge;
 
 pthread_mutex_t RES_MUTEX = PTHREAD_MUTEX_INITIALIZER;
@@ -1007,6 +1009,7 @@ void virtio_close() {
     for (int i = 0; i < vdevs_num; i++)
         vdevs[i]->virtio_close(vdevs[i]);
     close(ko_fd);
+    if (virtio_irq_fd >= 0) close(virtio_irq_fd);
     munmap((void *)virtio_bridge, MMAP_SIZE);
     for (int i = 0; i < MAX_ZONES; i++) {
         for (int j = 0; j < MAX_RAMS; j++)
@@ -1019,61 +1022,87 @@ void virtio_close() {
     log_warn("virtio daemon exit successfully");
 }
 
-void handle_virtio_requests() {
-    int sig;
-    sigset_t wait_set;
-    struct timespec timeout;
+static void virtio_irq_handler(int fd, int type, void *param) {
+    uint64_t val;
+    if (read(fd, &val, sizeof(val)) < 0) {
+        if (errno != EAGAIN) log_error("read eventfd failed");
+        return;
+    }
+
     unsigned int req_front = virtio_bridge->req_front;
     volatile struct device_req *req;
-    timeout.tv_sec = 0;
-    timeout.tv_nsec = WAIT_TIME;
-    sigemptyset(&wait_set);
-    sigaddset(&wait_set, SIGHVI);
-    sigaddset(&wait_set, SIGTERM);
-    virtio_bridge->need_wakeup = 1;
 
-    int signal_count = 0, proc_count = 0;
-    unsigned long long count = 0;
-    for (;;) {
-#ifndef LOONGARCH64
-        log_warn("signal_count is %d, proc_count is %d", signal_count,
-                 proc_count);
-        sigwait(&wait_set, &sig); // change to no signal irq
-        signal_count++;
-        if (sig == SIGTERM) {
-            virtio_close();
-            break;
-        } else if (sig != SIGHVI) {
-            log_error("unknown signal %d", sig);
-            continue;
-        }
-#endif
-        while (1) {
-            if (!is_queue_empty(req_front, virtio_bridge->req_rear)) {
-                count = 0;
-                proc_count++;
-                req = &virtio_bridge->req_list[req_front];
-                virtio_bridge->need_wakeup = 0;
-                virtio_handle_req(req);
-                req_front = (req_front + 1) & (MAX_REQ - 1);
-                virtio_bridge->req_front = req_front;
-                write_barrier();
-            }
-#ifndef LOONGARCH64
-            else {
-                count++;
-                if (count < 10000000)
-                    continue;
-                count = 0;
-                virtio_bridge->need_wakeup = 1;
-                write_barrier();
-                nanosleep(&timeout, NULL);
-                if (is_queue_empty(req_front, virtio_bridge->req_rear)) {
-                    break;
-                }
-            }
-#endif
-        }
+    while (!is_queue_empty(req_front, virtio_bridge->req_rear)) {
+        req = &virtio_bridge->req_list[req_front];
+        virtio_bridge->need_wakeup = 0;
+        virtio_handle_req(req);
+        req_front = (req_front + 1) & (MAX_REQ - 1);
+        virtio_bridge->req_front = req_front;
+        write_barrier();
+    }
+    
+    // Ensure we are ready for next interrupt
+    virtio_bridge->need_wakeup = 1;
+    write_barrier();
+}
+
+static void virtio_sig_handler(int fd, int type, void *param) {
+    struct signalfd_siginfo fdsi;
+    ssize_t s;
+    
+    s = read(fd, &fdsi, sizeof(struct signalfd_siginfo));
+    if (s != sizeof(struct signalfd_siginfo)) {
+        log_error("read signalfd failed");
+        return;
+    }
+
+    if (fdsi.ssi_signo == SIGTERM || fdsi.ssi_signo == SIGINT) {
+        log_warn("Received signal %d, exiting...", fdsi.ssi_signo);
+        virtio_close();
+        exit(0);
+    }
+}
+
+void handle_virtio_requests() {
+    sigset_t mask;
+    int sfd;
+
+    // Block signals so that they can be handled by signalfd
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGINT);
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
+        log_error("sigprocmask failed");
+        exit(1);
+    }
+
+    // Create signalfd
+    sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (sfd < 0) {
+        log_error("signalfd failed");
+        exit(1);
+    }
+
+    // Register event handlers to io_uring monitor
+    if (add_event(virtio_irq_fd, POLLIN, virtio_irq_handler, NULL) == NULL) {
+        log_error("add virtio_irq_fd event failed");
+        exit(1);
+    }
+
+    if (add_event(sfd, POLLIN, virtio_sig_handler, NULL) == NULL) {
+        log_error("add signalfd event failed");
+        exit(1);
+    }
+
+    virtio_bridge->need_wakeup = 1;
+    write_barrier();
+
+    log_info("virtio daemon started, waiting for events...");
+
+    // Main thread just waits. 
+    // The actual work is done in the event_monitor thread.
+    while (1) {
+        pause();
     }
 }
 
@@ -1125,6 +1154,24 @@ int virtio_init(const char *device_path) {
         log_error("open hvisor failed: %s", path);
         exit(1);
     }
+
+    // Create eventfd for interrupt notification
+    virtio_irq_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (virtio_irq_fd < 0) {
+        log_error("create eventfd failed");
+        close(ko_fd);
+        exit(1);
+    }
+
+    // Register eventfd to kernel module
+    err = ioctl(ko_fd, HVISOR_SET_EVENTFD, virtio_irq_fd);
+    if (err) {
+        log_error("ioctl set eventfd failed, err code is %d", err);
+        close(virtio_irq_fd);
+        close(ko_fd);
+        exit(1);
+    }
+
     // ioctl for init virtio
     // Communicate with hvisor kernel module
     err = ioctl(ko_fd, HVISOR_INIT_VIRTIO);
