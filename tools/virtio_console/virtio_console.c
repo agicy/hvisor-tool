@@ -13,20 +13,23 @@
 #include "virtio_console.h"
 #include "log.h"
 #include "virtio.h"
+
 #include <errno.h>
 #include <fcntl.h>
+#include <liburing.h>
 #include <math.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/eventfd.h>
 #include <sys/time.h>
 #include <termios.h>
-#include <poll.h>
-#include <sys/eventfd.h>
-#include <pthread.h>
-#include <liburing.h>
 
 static uint8_t trashbuf[1024];
 
+/// @brief Initialize the console device.
+/// @return Pointer to the initialized ConsoleDev structure.
 ConsoleDev *init_console_dev() {
     ConsoleDev *dev = (ConsoleDev *)malloc(sizeof(ConsoleDev));
     dev->config.cols = 80;
@@ -38,10 +41,13 @@ ConsoleDev *init_console_dev() {
     return dev;
 }
 
+/// @brief Handler for console RX completion events.
+/// @param param Pointer to the console request structure.
+/// @param res Result of the I/O operation.
 static void virtio_console_rx_completion_handler(void *param, int res) {
     struct console_req *req = (struct console_req *)param;
+
     VirtIODevice *vdev = req->vdev;
-    // ConsoleDev *dev = vdev->dev;
     VirtQueue *vq = req->vq;
 
     if (res == -EAGAIN) {
@@ -52,44 +58,51 @@ static void virtio_console_rx_completion_handler(void *param, int res) {
 
     if (res < 0) {
         if (res != -ECANCELED)
-             log_trace("console rx error: %d", res);
+            log_trace("console rx error: %d", res);
         res = 0;
     }
-    
+
+    // Update the virtqueue used ring
     update_used_ring(vq, req->idx, res);
+
+    // Inject an interrupt to signal the guest that data is available
     virtio_inject_irq(vq);
-    
+
+    // Free the request structure
     free(req->iov);
     free(req);
 }
 
+/// @brief Event handler for console events
+/// @param fd The file descriptor associated with the event.
+/// @param epoll_type The type of event (e.g., POLLIN).
+/// @param param Pointer to the VirtIODevice structure.
 static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
-    // log_debug("%s", __func__);
     VirtIODevice *vdev = (VirtIODevice *)param;
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     VirtQueue *vq = &vdev->vqs[CONSOLE_QUEUE_RX];
-    
+
     if (epoll_type != POLLIN || fd != dev->master_fd) {
         log_error("Invalid console event");
         return;
     }
+
     if (dev->master_fd <= 0 || vdev->type != VirtioTConsole) {
         log_error("console event handler should not be called");
         return;
     }
 
+    // Handle pending RX request
     if (dev->pending_rx_req) {
         struct console_req *req = dev->pending_rx_req;
         dev->pending_rx_req = NULL;
-        
+
         struct io_uring *ring = get_global_ring();
-        pthread_mutex_t *ring_mutex = get_global_ring_mutex();
-        pthread_mutex_lock(ring_mutex);
         struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+
         io_uring_prep_readv(sqe, dev->master_fd, req->iov, req->iovcnt, 0);
         io_uring_sqe_set_data(sqe, &req->hevent);
         io_uring_submit(ring);
-        pthread_mutex_unlock(ring_mutex);
         return;
     }
 
@@ -123,16 +136,20 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     req->hevent.free_on_completion = false;
 
     struct io_uring *ring = get_global_ring();
-    pthread_mutex_t *ring_mutex = get_global_ring_mutex();
-    pthread_mutex_lock(ring_mutex);
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     io_uring_prep_readv(sqe, dev->master_fd, req->iov, req->iovcnt, 0);
     io_uring_sqe_set_data(sqe, &req->hevent);
     io_uring_submit(ring);
-    pthread_mutex_unlock(ring_mutex);
 }
 
+/// @brief Handler for kick events from the guest.
+/// @param fd The file descriptor associated with the kick event.
+/// @param epoll_type The type of event (e.g., POLLIN).
+/// @param param Pointer to the VirtIODevice structure.
 static void virtio_console_kick_handler(int fd, int epoll_type, void *param) {
+    // Legacy function, now unused in single-threaded mode.
+    // Kept for reference or if we ever revert to multi-threaded.
+    // In current model, we use direct calls.
     VirtIODevice *vdev = (VirtIODevice *)param;
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     uint64_t val;
@@ -141,6 +158,9 @@ static void virtio_console_kick_handler(int fd, int epoll_type, void *param) {
     virtio_console_rxq_process(vdev, &vdev->vqs[CONSOLE_QUEUE_RX]);
 }
 
+/// @brief Initialize the virtio console device.
+/// @param vdev Pointer to the VirtIODevice structure.
+/// @return 0 on success, -1 on failure.
 int virtio_console_init(VirtIODevice *vdev) {
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     int master_fd, slave_fd;
@@ -178,25 +198,29 @@ int virtio_console_init(VirtIODevice *vdev) {
         log_error("Failed to set nonblocking mode, fd closed!");
     }
 
-    // Init worker
-    dev->kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (dev->kick_fd < 0) {
-        log_error("eventfd failed");
-        return -1;
-    }
+    // In single-threaded model, we don't need kick_fd for self-notification
+    // We can call processing functions directly.
+    dev->kick_fd = -1;
 
-    add_event(dev->kick_fd, POLLIN, virtio_console_kick_handler, vdev);
-    dev->event = add_event(dev->master_fd, POLLIN, virtio_console_event_handler, vdev);
+    // Register master_fd to event loop for RX (Host -> Guest)
+    dev->event =
+        add_event(dev->master_fd, POLLIN, virtio_console_event_handler, vdev);
 
     vdev->virtio_close = virtio_console_close;
     return 0;
 }
 
+/// @brief Process the RX queue for the console device.
+/// @param vdev Pointer to the VirtIODevice structure.
+/// @param vq Pointer to the VirtQueue structure.
 static void virtio_console_rxq_process(VirtIODevice *vdev, VirtQueue *vq) {
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     virtio_console_event_handler(dev->master_fd, POLLIN, vdev);
 }
 
+/// @brief Process the TX queue for the console device.
+/// @param vdev Pointer to the VirtIODevice structure.
+/// @param vq Pointer to the VirtQueue structure.
 static void virtio_console_txq_process(VirtIODevice *vdev, VirtQueue *vq) {
     int quota = 64;
     while (!virtqueue_is_empty(vq) && quota > 0) {
@@ -207,36 +231,49 @@ static void virtio_console_txq_process(VirtIODevice *vdev, VirtQueue *vq) {
         }
         virtqueue_enable_notify(vq);
     }
-    if (!virtqueue_is_empty(vq)) {
-        ConsoleDev *dev = (ConsoleDev *)vdev->dev;
-        uint64_t val = 1;
-        write(dev->kick_fd, &val, sizeof(val));
-    }
 }
 
-int virtio_console_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
-    log_debug("%s", __func__);
-    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
-    uint64_t val = 1;
-    enable_event_poll(dev->event);
-    write(dev->kick_fd, &val, sizeof(val));
+/// @brief Notify handler for the TX queue.
+/// @param vdev Pointer to the VirtIODevice structure.
+/// @param vq Pointer to the VirtQueue structure.
+/// @return 0 on success.
+int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
+    virtio_console_txq_process(vdev, vq);
     return 0;
 }
 
+/// @brief Notify handler for the RX queue.
+/// @param vdev Pointer to the VirtIODevice structure.
+/// @param vq Pointer to the VirtQueue structure.
+/// @return 0 on success.
+int virtio_console_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
+    log_debug("%s", __func__);
+    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
+    enable_event_poll(dev->event);
+    virtio_console_rxq_process(vdev, vq);
+    return 0;
+}
+
+/// @brief Handler for console TX completion events.
+/// @param param Pointer to the console request structure.
+/// @param res Result of the I/O operation.
 static void virtio_console_tx_completion_handler(void *param, int res) {
     struct console_req *req = (struct console_req *)param;
     VirtQueue *vq = req->vq;
-    
+
     if (res < 0) {
         log_error("console tx error: %d", res);
         res = 0;
     }
-    
-    update_used_ring(vq, req->idx, 0); 
+
+    update_used_ring(vq, req->idx, 0);
     free(req->iov);
     free(req);
 }
 
+/// @brief Handle a single request from the TX queue.
+/// @param dev Pointer to the ConsoleDev structure.
+/// @param vq Pointer to the VirtQueue structure.
 static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
     VirtIODevice *vdev = vq->dev;
     int n;
@@ -262,17 +299,18 @@ static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
     req->hevent.completion_handler = virtio_console_tx_completion_handler;
     req->hevent.param = req;
     req->hevent.free_on_completion = false;
-    
+
     struct io_uring *ring = get_global_ring();
-    pthread_mutex_t *ring_mutex = get_global_ring_mutex();
-    pthread_mutex_lock(ring_mutex);
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     io_uring_prep_writev(sqe, dev->master_fd, req->iov, req->iovcnt, 0);
     io_uring_sqe_set_data(sqe, &req->hevent);
     io_uring_submit(ring);
-    pthread_mutex_unlock(ring_mutex);
 }
 
+/// @brief Notify handler for the TX queue.
+/// @param vdev Pointer to the VirtIODevice structure.
+/// @param vq Pointer to the VirtQueue structure.
+/// @return 0 on success.
 int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     log_debug("%s", __func__);
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
@@ -281,11 +319,16 @@ int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     return 0;
 }
 
+/// @brief Close the virtio console device and release resources.
+/// @param vdev Pointer to the VirtIODevice structure.
 void virtio_console_close(VirtIODevice *vdev) {
-    ConsoleDev *dev = vdev->dev;
-    close(dev->master_fd);
-    close(dev->kick_fd);
-    free(dev->event);
+    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
+    if (dev->master_fd >= 0) {
+        close(dev->master_fd);
+    }
+    if (dev->kick_fd >= 0) {
+        close(dev->kick_fd);
+    }
     free(dev);
     free(vdev->vqs);
     free(vdev);

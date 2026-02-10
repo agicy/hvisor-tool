@@ -16,11 +16,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/eventfd.h>
-#include <sys/signalfd.h>
 #include <sys/prctl.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -923,17 +923,18 @@ void virtio_inject_irq(VirtQueue *vq) {
     volatile struct device_res *res;
 
     // virtio_bridge is a global resource located in shared memory.
-    // Since we are now running in a single-threaded reactor model (via io_uring),
-    // and the shared resources related to res_list are only accessed here
-    // in the event loop, we no longer need a mutex lock.
-    // The previous lock was to protect against concurrent access between
-    // main thread and signal thread, which are now merged.
+    // Since we are now running in a single-threaded reactor model (via
+    // io_uring), and the shared resources related to res_list are only accessed
+    // here in the event loop, we no longer need a mutex lock. The previous lock
+    // was to protect against concurrent access between main thread and signal
+    // thread, which are now merged.
 
     while (is_queue_full(virtio_bridge->res_front, virtio_bridge->res_rear,
                          MAX_REQ)) {
-        // Simple busy wait or yield if queue is full. 
+        // Simple busy wait or yield if queue is full.
         // In a single-threaded model, if we block here, we block everything.
-        // However, this queue is consumed by the hypervisor/kernel, so we wait for it to drain.
+        // However, this queue is consumed by the hypervisor/kernel, so we wait
+        // for it to drain.
         usleep(10);
     }
     unsigned int res_rear = virtio_bridge->res_rear;
@@ -1007,7 +1008,8 @@ void virtio_close() {
     for (int i = 0; i < vdevs_num; i++)
         vdevs[i]->virtio_close(vdevs[i]);
     close(ko_fd);
-    if (virtio_irq_fd >= 0) close(virtio_irq_fd);
+    if (virtio_irq_fd >= 0)
+        close(virtio_irq_fd);
     munmap((void *)virtio_bridge, MMAP_SIZE);
     for (int i = 0; i < MAX_ZONES; i++) {
         for (int j = 0; j < MAX_RAMS; j++)
@@ -1023,7 +1025,8 @@ void virtio_close() {
 static void virtio_irq_handler(int fd, int type, void *param) {
     uint64_t val;
     if (read(fd, &val, sizeof(val)) < 0) {
-        if (errno != EAGAIN) log_error("read eventfd failed");
+        if (errno != EAGAIN)
+            log_error("read eventfd failed");
         return;
     }
 
@@ -1038,7 +1041,7 @@ static void virtio_irq_handler(int fd, int type, void *param) {
         virtio_bridge->req_front = req_front;
         write_barrier();
     }
-    
+
     // Ensure we are ready for next interrupt
     virtio_bridge->need_wakeup = 1;
     write_barrier();
@@ -1047,7 +1050,7 @@ static void virtio_irq_handler(int fd, int type, void *param) {
 static void virtio_sig_handler(int fd, int type, void *param) {
     struct signalfd_siginfo fdsi;
     ssize_t s;
-    
+
     s = read(fd, &fdsi, sizeof(struct signalfd_siginfo));
     if (s != sizeof(struct signalfd_siginfo)) {
         log_error("read signalfd failed");
@@ -1098,12 +1101,12 @@ int virtio_init(const char *device_path) {
     initialize_log();
 
     log_info("hvisor init");
-    
-    // Determine which device node to use. 
+
+    // Determine which device node to use.
     // This supports multi-process architecture where each daemon instance
     // connects to a specific device node (e.g., /dev/hvisor0, /dev/hvisor1).
     const char *path = device_path ? device_path : "/dev/hvisor";
-    
+
     ko_fd = open(path, O_RDWR);
     if (ko_fd < 0) {
         log_error("open hvisor failed: %s", path);
@@ -1347,8 +1350,8 @@ err_out:
  * should connect to.
  *
  * @param json_path Path to the JSON configuration file
- * @return Allocated string containing the device path, or NULL if not found/error.
- *         Caller is responsible for freeing the returned string.
+ * @return Allocated string containing the device path, or NULL if not
+ * found/error. Caller is responsible for freeing the returned string.
  */
 char *virtio_get_device_path(char *json_path) {
     char *buffer = NULL;
@@ -1356,7 +1359,8 @@ char *virtio_get_device_path(char *json_path) {
     char *path = NULL;
 
     buffer = read_file(json_path, &file_size);
-    if (!buffer) return NULL;
+    if (!buffer)
+        return NULL;
     buffer[file_size] = '\0';
 
     cJSON *root = SAFE_CJSON_PARSE(buffer);
@@ -1384,12 +1388,13 @@ char *virtio_get_device_path(char *json_path) {
  */
 int virtio_start(int argc, char *argv[]) {
     int opt, err = 0;
-    
+
     // Parse device path from config first to ensure we connect to the correct
     // kernel device node before initialization.
     char *dev_path = virtio_get_device_path(argv[3]);
     err = virtio_init(dev_path); // Initialize virtio dependencies
-    if (dev_path) free(dev_path);
+    if (dev_path)
+        free(dev_path);
     if (err)
         return -1;
 
@@ -1427,12 +1432,13 @@ int virtio_start(int argc, char *argv[]) {
     }
 
     // Register event handlers to io_uring monitor
-    if (add_event(virtio_irq_fd, POLLIN, virtio_irq_handler, NULL) == NULL) {
+    if (add_persistent_event(virtio_irq_fd, POLLIN, virtio_irq_handler, NULL) ==
+        NULL) {
         log_error("add virtio_irq_fd event failed");
         return -1;
     }
 
-    if (add_event(sfd, POLLIN, virtio_sig_handler, NULL) == NULL) {
+    if (add_persistent_event(sfd, POLLIN, virtio_sig_handler, NULL) == NULL) {
         log_error("add signalfd event failed");
         return -1;
     }
@@ -1444,7 +1450,7 @@ int virtio_start(int argc, char *argv[]) {
 
     // Run the event loop directly in the main thread
     run_event_loop();
-    
+
     return 0;
 err_out:
     virtio_close();

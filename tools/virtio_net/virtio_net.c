@@ -14,17 +14,17 @@
 #include "virtio.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <liburing.h>
 #include <linux/if_tun.h>
 #include <net/if.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/uio.h>
 #include <unistd.h>
-#include <poll.h>
-#include <sys/eventfd.h>
-#include <pthread.h>
-#include <liburing.h>
 
 // The max bytes of a packet in data link layer is 1518 bytes.
 static uint8_t trashbuf[1600];
@@ -123,8 +123,9 @@ int virtio_net_init(VirtIODevice *vdev, char *devname) {
         return -1;
     }
 
-    add_event(dev->kick_fd, POLLIN, virtio_net_kick_handler, vdev);
-    dev->event = add_event(dev->tapfd, POLLIN, virtio_net_event_handler, vdev);
+    add_persistent_event(dev->kick_fd, POLLIN, virtio_net_kick_handler, vdev);
+    dev->event = add_persistent_event(dev->tapfd, POLLIN,
+                                      virtio_net_event_handler, vdev);
 
     vdev->virtio_close = virtio_net_close;
     return 0;
@@ -206,20 +207,17 @@ void virtio_net_event_handler(int fd, int epoll_type, void *param) {
     VirtIODevice *vdev = param;
     NetDev *net = vdev->dev;
     VirtQueue *vq = &vdev->vqs[NET_QUEUE_RX];
-    
+
     if (net->pending_rx_req) {
         struct net_req *req = net->pending_rx_req;
         net->pending_rx_req = NULL;
-        
+
         struct io_uring *ring = get_global_ring();
-        pthread_mutex_t *ring_mutex = get_global_ring_mutex();
-        
-        pthread_mutex_lock(ring_mutex);
         struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+
         io_uring_prep_readv(sqe, net->tapfd, req->iov_packet, req->iovcnt, 0);
         io_uring_sqe_set_data(sqe, &req->hevent);
         io_uring_submit(ring);
-        pthread_mutex_unlock(ring_mutex);
         return;
     }
 
@@ -257,29 +255,26 @@ void virtio_net_event_handler(int fd, int epoll_type, void *param) {
     req->hevent.free_on_completion = false;
 
     struct io_uring *ring = get_global_ring();
-    pthread_mutex_t *ring_mutex = get_global_ring_mutex();
 
-    pthread_mutex_lock(ring_mutex);
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     io_uring_prep_readv(sqe, net->tapfd, req->iov_packet, req->iovcnt, 0);
     io_uring_sqe_set_data(sqe, &req->hevent);
     io_uring_submit(ring);
-    pthread_mutex_unlock(ring_mutex);
 }
 
 static void virtio_net_tx_completion_handler(void *param, int res) {
     struct net_req *req = (struct net_req *)param;
     VirtQueue *vq = req->vq;
-    
+
     if (res < 0) {
         log_debug("net tx error: %d", res);
-        res = 0; 
+        res = 0;
     }
-    
+
     size_t header_len = get_nethdr_size(req->vdev);
     update_used_ring(vq, req->idx, res + header_len);
     virtio_inject_irq(vq);
-    
+
     free(req->iov);
     free(req);
 }
@@ -301,7 +296,7 @@ static void virtq_tx_handle_one_request(VirtIODevice *vdev, VirtQueue *vq) {
     if (n < 1) {
         return;
     }
-    
+
     struct net_req *req = calloc(1, sizeof(struct net_req));
     req->iov = iov;
     req->idx = idx;
@@ -322,23 +317,20 @@ static void virtq_tx_handle_one_request(VirtIODevice *vdev, VirtQueue *vq) {
         iov[n].iov_len = 64 - packet_len;
         n++;
     }
-    
+
     req->iov_packet = iov;
     req->iovcnt = n;
-    
+
     req->hevent.completion_handler = virtio_net_tx_completion_handler;
     req->hevent.param = req;
     req->hevent.free_on_completion = false;
-    
+
     struct io_uring *ring = get_global_ring();
-    pthread_mutex_t *ring_mutex = get_global_ring_mutex();
-    
-    pthread_mutex_lock(ring_mutex);
+
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     io_uring_prep_writev(sqe, net->tapfd, req->iov_packet, req->iovcnt, 0);
     io_uring_sqe_set_data(sqe, &req->hevent);
     io_uring_submit(ring);
-    pthread_mutex_unlock(ring_mutex);
 }
 
 int virtio_net_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
@@ -356,4 +348,3 @@ int virtio_net_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     write(dev->kick_fd, &val, sizeof(val));
     return 0;
 }
-

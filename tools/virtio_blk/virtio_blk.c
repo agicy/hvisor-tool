@@ -8,19 +8,22 @@
  * Authors:
  *      Guowei Li <2401213322@stu.pku.edu.cn>
  */
+
 #include "virtio_blk.h"
+
+#include "event_monitor.h"
 #include "log.h"
 #include "virtio.h"
+
 #include <errno.h>
 #include <fcntl.h>
+#include <liburing.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/param.h>
 #include <sys/stat.h>
-#include <liburing.h>
-#include <sys/eventfd.h>
-#include <pthread.h>
-#include "event_monitor.h"
 
 static void virtio_blk_completion_handler(void *param, int res);
 
@@ -44,8 +47,6 @@ static void complete_block_operation(BlkDev *dev, struct blkp_req *req,
     free(req);
 }
 
-#include "event_monitor.h"
-
 static void virtio_blk_completion_handler(void *param, int res) {
     struct blkp_req *req = (struct blkp_req *)param;
     BlkDev *dev = req->dev;
@@ -66,7 +67,7 @@ static void virtio_blk_completion_handler(void *param, int res) {
 static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
     struct iovec *iov = req->iov;
     int n = req->iovcnt;
-    
+
     struct io_uring *ring = get_global_ring();
     struct io_uring_sqe *sqe;
 
@@ -105,7 +106,6 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
     }
 }
 
-
 // create blk dev.
 BlkDev *init_blk_dev(VirtIODevice *vdev) {
     BlkDev *dev = malloc(sizeof(BlkDev));
@@ -139,11 +139,11 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
     vdev->virtio_close = virtio_blk_close;
     log_info("debug: virtio_blk_init: %s, size is %lld", img_path,
              dev->config.capacity);
-    
+
     // In single-threaded model, we don't need kick_fd for self-notification
     // We can call processing functions directly.
     dev->kick_fd = -1;
-    
+
     return 0;
 }
 
@@ -208,18 +208,18 @@ static void virtio_blk_process_queue(VirtIODevice *vdev, VirtQueue *vq) {
     BlkDev *blkDev = (BlkDev *)vdev->dev;
     struct blkp_req *breq;
     int quota = 64;
-    
+
     while (!virtqueue_is_empty(vq) && quota > 0) {
         virtqueue_disable_notify(vq);
         while (!virtqueue_is_empty(vq) && quota > 0) {
             breq = virtq_blk_handle_one_request(vq);
             if (breq)
-                 blkproc(blkDev, breq, vq);
+                blkproc(blkDev, breq, vq);
             quota--;
         }
         virtqueue_enable_notify(vq);
     }
-    
+
     // In single-threaded model, we don't need to kick ourselves.
     // If there are more requests, they will be processed in next iteration
     // or by direct call if we loop here.
@@ -233,7 +233,8 @@ int virtio_blk_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
 void virtio_blk_close(VirtIODevice *vdev) {
     BlkDev *dev = (BlkDev *)vdev->dev;
     close(dev->img_fd);
-    if (dev->kick_fd >= 0) close(dev->kick_fd);
+    if (dev->kick_fd >= 0)
+        close(dev->kick_fd);
     free(dev);
     free(vdev->vqs);
     free(vdev);
