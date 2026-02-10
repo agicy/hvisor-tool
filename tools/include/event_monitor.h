@@ -24,10 +24,12 @@ struct hvisor_event {
 };
 
 struct io_uring *get_global_ring(void);
-pthread_mutex_t *get_global_ring_mutex(void);
 struct hvisor_event *add_event(int fd, int epoll_type,
                                void (*handler)(int, int, void *), void *param);
 struct hvisor_event *add_completion_event(void (*handler)(void *, int), void *param);
 void enable_event_poll(struct hvisor_event *hevent);
 void disable_event_poll(struct hvisor_event *hevent);
+void run_event_loop(void); // New function to run the loop in current thread
+int initialize_event_monitor(void);
+void destroy_event_monitor(void);
 #endif // HVISOR_EVENT_H

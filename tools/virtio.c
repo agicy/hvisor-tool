@@ -1063,49 +1063,6 @@ static void virtio_sig_handler(int fd, int type, void *param) {
     }
 }
 
-void handle_virtio_requests() {
-    sigset_t mask;
-    int sfd;
-
-    // Block signals so that they can be handled by signalfd
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGINT);
-    if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
-        log_error("sigprocmask failed");
-        exit(1);
-    }
-
-    // Create signalfd
-    sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
-    if (sfd < 0) {
-        log_error("signalfd failed");
-        exit(1);
-    }
-
-    // Register event handlers to io_uring monitor
-    if (add_event(virtio_irq_fd, POLLIN, virtio_irq_handler, NULL) == NULL) {
-        log_error("add virtio_irq_fd event failed");
-        exit(1);
-    }
-
-    if (add_event(sfd, POLLIN, virtio_sig_handler, NULL) == NULL) {
-        log_error("add signalfd event failed");
-        exit(1);
-    }
-
-    virtio_bridge->need_wakeup = 1;
-    write_barrier();
-
-    log_info("virtio daemon started, waiting for events...");
-
-    // Main thread just waits. 
-    // The actual work is done in the event_monitor thread.
-    while (1) {
-        pause();
-    }
-}
-
 void initialize_log() {
     int log_level;
 #ifdef HLOG
@@ -1451,7 +1408,45 @@ int virtio_start(int argc, char *argv[]) {
     virtio_bridge->mmio_avail = 1;
     write_barrier();
 
-    handle_virtio_requests(); // Handle virtio requests
+    // Setup event loop and signal handling
+    sigset_t mask;
+    int sfd;
+
+    // Block signals so that they can be handled by signalfd
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGINT);
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
+        log_error("sigprocmask failed");
+        return -1;
+    }
+
+    // Create signalfd
+    sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (sfd < 0) {
+        log_error("signalfd failed");
+        return -1;
+    }
+
+    // Register event handlers to io_uring monitor
+    if (add_event(virtio_irq_fd, POLLIN, virtio_irq_handler, NULL) == NULL) {
+        log_error("add virtio_irq_fd event failed");
+        return -1;
+    }
+
+    if (add_event(sfd, POLLIN, virtio_sig_handler, NULL) == NULL) {
+        log_error("add signalfd event failed");
+        return -1;
+    }
+
+    virtio_bridge->need_wakeup = 1;
+    write_barrier();
+
+    log_info("virtio daemon started, entering event loop...");
+
+    // Run the event loop directly in the main thread
+    run_event_loop();
+    
     return 0;
 err_out:
     virtio_close();
