@@ -1,8 +1,16 @@
-sources ?= $(wildcard *.c) ../cJSON/cJSON.c
-objects ?= $(sources:.c=.o)
+# sources ?= $(wildcard *.c) ../cJSON/cJSON.c
+# objects ?= $(sources:.c=.o)
+c_sources := $(wildcard *.c) ../cJSON/cJSON.c
+c_objects := $(c_sources:.c=.o)
+
+cpp_sources := $(wildcard *.cpp) $(wildcard ./virtio_runtime/src/*.cpp) $(wildcard ./virtio_blk/*.cpp) $(wildcard ./virtio_net/*.cpp) $(wildcard ./virtio_console/*.cpp)
+cpp_objects := $(cpp_sources:.cpp=.o)
+
 ivc_demo_object ?= ivc_demo.o
 rpmsg_demo_object ?= rpmsg_demo.o
-hvisor_objects ?= $(filter-out $(ivc_demo_object) $(rpmsg_demo_object), $(objects))
+
+# hvisor_objects ?= $(filter-out $(ivc_demo_object) $(rpmsg_demo_object), $(objects))
+hvisor_objects := $(filter-out $(ivc_demo_object) $(rpmsg_demo_object), $(c_objects)) $(cpp_objects)
 ROOT ?=
 # gnu or musl
 LIBC ?= gnu
@@ -37,15 +45,16 @@ CFLAGS := -Wall -Wextra -DLOG_USE_COLOR -DHLOG=$(LOG) -pthread
 # Otherwise use default flags from cross-compiler
 ifneq ($(ROOT),)
 CFLAGS += --sysroot=$(ROOT)
+CXXFLAGS += --sysroot=$(ROOT)
 endif
 
-include_dirs := -I../include -I./include -I../cJSON
+include_dirs := -I../include -I./include -I../cJSON -I./virtio_runtime/include
 
 ifeq ($(LIBC), musl)
 include_dirs += -I./compat/
 endif
 
-LDFLAGS := -lpthread -static -luring
+LDFLAGS := -lpthread -static -luring -lstdc++
 
 # LIBS := -L$(ROOT)/usr/lib/$(toolchain) -L$(ROOT)/lib
 # LIBS := -L/opt/aarch64-linux-musl-cross/aarch64-linux-musl -L/opt/aarch64-linux-musl-cross/lib
@@ -55,21 +64,27 @@ ifeq ($(VIRTIO_GPU), y)
 	CFLAGS += -DENABLE_VIRTIO_GPU
 endif
 
-sources += $(wildcard ./virtio_blk/*.c)
-sources += $(wildcard ./virtio_net/*.c)
-sources += $(wildcard ./virtio_console/*.c)
+# sources += $(wildcard ./virtio_blk/*.c)
+# sources += $(wildcard ./virtio_net/*.c)
+# sources += $(wildcard ./virtio_console/*.c)
 
-include $(sources:.c=.d)
+include $(c_sources:.c=.d)
+# include $(cpp_sources:.cpp=.d)
 
 ifeq ($(DEBUG), y)
 	CFLAGS += -g -O0
+	CXXFLAGS += -g -O0
 else
 	CFLAGS += -O2
+	CXXFLAGS += -O2
 endif
 
 CC := $(toolchain)-gcc
+CXX := $(toolchain)-g++
 READELF := $(toolchain)-readelf
 OBJDUMP := $(toolchain)-objdump
+
+CXXFLAGS += $(CFLAGS) -std=c++20 -fcoroutines
 
 ifeq ($(ARCH), arm64)
 	ifeq ($(VIRTIO_GPU), y)
@@ -98,11 +113,14 @@ all: hvisor ivc_demo rpmsg_demo
 	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@; \
 	rm -f $@.$$$$
 
-$(objects): %.o: %.c
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(include_dirs) -c $< -o $@
+
+$(c_objects): %.o: %.c
 	$(CC) $(CFLAGS) $(include_dirs) $(LIBS) -c -o $@ $<
 
 hvisor: $(hvisor_objects)
-	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LDFLAGS) $(LIBS)
+	$(CXX) -o $@ $^ $(CFLAGS) $(include_dirs) $(LDFLAGS) $(LIBS)
 
 ivc_demo: $(ivc_demo_object)
 	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LDFLAGS) $(LIBS)

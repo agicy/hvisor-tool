@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <liburing.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -57,12 +58,23 @@ struct io_uring *get_global_ring(void) { return &ring; }
 /// @return A valid pointer to an io_uring_sqe.
 struct io_uring_sqe *get_sqe_safe(struct io_uring *ring) {
     struct io_uring_sqe *sqe;
+    int retries = 0;
     do {
         sqe = io_uring_get_sqe(ring);
         if (!sqe) {
             // SQ full, force submission to clear space
-            log_debug("io_uring ring full, force submission");
+            // Only log sparingly to avoid performance degradation
+            if ((retries & 0xFF) == 0) {
+                log_debug("io_uring ring full, force submission");
+            }
             io_uring_submit(ring);
+
+            // Adaptive strategy: Spin for a while, then yield if stuck
+            // This prevents system call storm and CPU burning while maintaining
+            // low latency
+            if (++retries > 128) {
+                sched_yield();
+            }
         }
     } while (!sqe);
     return sqe;
@@ -80,7 +92,7 @@ void enable_event_poll(struct poll_event *pevent) {
     // Enable event polling by adding the event to the io_uring ring
     struct io_uring_sqe *sqe = get_sqe_safe(&ring);
     io_uring_prep_poll_add(sqe, pevent->fd, pevent->epoll_type);
-    sqe->len |= IORING_POLL_ADD_MULTI;
+    // sqe->len |= IORING_POLL_ADD_MULTI; // Not supported in Kernel 5.10
     io_uring_sqe_set_data(sqe, pevent);
     io_uring_submit(&ring);
 
@@ -197,6 +209,15 @@ static void handle_cqe(struct io_uring_cqe *cqe) {
         } else {
             // Call the handler for poll events
             pevent->handler(pevent->fd, pevent->epoll_type, pevent->param);
+
+            // Re-arm poll for one-shot behavior (Kernel < 5.13 compatibility)
+            // Since IORING_POLL_ADD_MULTI is not supported in 5.10, we must
+            // manually re-submit the poll request after each trigger.
+            if (pevent->active) {
+                struct io_uring_sqe *sqe = get_sqe_safe(&ring);
+                io_uring_prep_poll_add(sqe, pevent->fd, pevent->epoll_type);
+                io_uring_sqe_set_data(sqe, pevent);
+            }
         }
         break;
     }
