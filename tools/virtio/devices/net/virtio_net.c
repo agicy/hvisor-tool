@@ -24,7 +24,7 @@
 // The max bytes of a packet in data link layer is 1518 bytes.
 static uint8_t trashbuf[1600];
 
-NetDev *init_net_dev(uint8_t mac[]) {
+NetDev *virtio_net_alloc_dev(uint8_t mac[]) {
     NetDev *dev = malloc(sizeof(NetDev));
     dev->config.mac[0] = mac[0];
     dev->config.mac[1] = mac[1];
@@ -40,7 +40,7 @@ NetDev *init_net_dev(uint8_t mac[]) {
 }
 
 // open tap device
-static int open_tap(char *devname) {
+static int virtio_net_open_tap(char *devname) {
     log_info("virtio net tap open");
     int tunfd;
     struct ifreq ifr;
@@ -76,7 +76,7 @@ int virtio_net_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     return 0;
 }
 /// remove the header in iov, return the new iov. the new iov num is in niov.
-static inline struct iovec *rm_iov_header(struct iovec *iov, int *niov,
+static inline struct iovec *virtio_net_remove_iov_header(struct iovec *iov, int *niov,
                                           int header_len) {
     if (iov == NULL || *niov == 0 || iov[0].iov_len < (size_t)header_len) {
         log_error("invalid iov");
@@ -95,7 +95,7 @@ static inline struct iovec *rm_iov_header(struct iovec *iov, int *niov,
     }
 }
 
-size_t get_nethdr_size(VirtIODevice *vdev) {
+static size_t virtio_net_get_hdr_size(VirtIODevice *vdev) {
     // Virtio 1.0 specifies the header as NetHdr. But the legacy version
     // specifies the headr as NetHdrLegacy
     if (vdev->regs.drv_feature & (1ULL << VIRTIO_F_VERSION_1)) {
@@ -106,7 +106,7 @@ size_t get_nethdr_size(VirtIODevice *vdev) {
 }
 
 /// Called when tap device received packets
-void virtio_net_event_handler(int fd, int epoll_type, void *param) {
+static void virtio_net_event_handler(int fd, int epoll_type, void *param) {
     log_debug("virtio_net_event_handler");
     VirtIODevice *vdev = param;
     void *vnet_header;
@@ -115,7 +115,7 @@ void virtio_net_event_handler(int fd, int epoll_type, void *param) {
     VirtQueue *vq = &vdev->vqs[NET_QUEUE_RX];
     int n, len;
     uint16_t idx;
-    size_t header_len = get_nethdr_size(vdev);
+    size_t header_len = virtio_net_get_hdr_size(vdev);
     if (fd != net->tapfd || epoll_type != EPOLLIN) {
         log_error("invalid event");
         return;
@@ -143,7 +143,7 @@ void virtio_net_event_handler(int fd, int epoll_type, void *param) {
             goto free_iov;
         }
         vnet_header = iov[0].iov_base;
-        iov_packet = rm_iov_header(iov, &n, header_len);
+        iov_packet = virtio_net_remove_iov_header(iov, &n, header_len);
         if (iov_packet == NULL)
             goto free_iov;
         // Read a packet from tap device
@@ -172,7 +172,7 @@ free_iov:
     free(iov);
 }
 
-static void virtq_tx_handle_one_request(VirtIODevice *vdev, VirtQueue *vq) {
+static void virtio_net_handle_tx_request(VirtIODevice *vdev, VirtQueue *vq) {
     struct iovec *iov = NULL;
     int i, n;
     int packet_len, all_len; // all_len include the header length.
@@ -180,7 +180,7 @@ static void virtq_tx_handle_one_request(VirtIODevice *vdev, VirtQueue *vq) {
     static char pad[64];
     ssize_t len;
     NetDev *net = vdev->dev;
-    size_t header_len = get_nethdr_size(vdev);
+    size_t header_len = virtio_net_get_hdr_size(vdev);
     if (net->tapfd == -1) {
         log_error("tap device is invalid");
         return;
@@ -217,7 +217,7 @@ int virtio_net_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     log_debug("virtio_net_txq_notify_handler");
     virtqueue_disable_notify(vq);
     while (!virtqueue_is_empty(vq)) {
-        virtq_tx_handle_one_request(vdev, vq);
+        virtio_net_handle_tx_request(vdev, vq);
     }
     virtqueue_enable_notify(vq);
     // TODO: Can we don't inject irq when send packets to improve performance?
@@ -230,7 +230,7 @@ int virtio_net_init(VirtIODevice *vdev, char *devname) {
     log_info("virtio net init");
     NetDev *net = vdev->dev;
     // open tap device
-    net->tapfd = open_tap(devname);
+    net->tapfd = virtio_net_open_tap(devname);
     if (net->tapfd == -1) {
         log_error("open tap device failed");
         return -1;

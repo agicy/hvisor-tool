@@ -18,7 +18,7 @@
 #include <sys/param.h>
 #include <sys/stat.h>
 
-static void complete_block_operation(BlkDev *dev, struct blkp_req *req,
+static void virtio_blk_complete_request(BlkDev *dev, struct blkp_req *req,
                                      VirtQueue *vq, int err,
                                      ssize_t written_len) {
     uint8_t *vstatus = (uint8_t *)(req->iov[req->iovcnt - 1].iov_base);
@@ -42,7 +42,7 @@ static void complete_block_operation(BlkDev *dev, struct blkp_req *req,
     free(req);
 }
 // get a blk req from procq
-static int get_breq(BlkDev *dev, struct blkp_req **req) {
+static int virtio_blk_get_request(BlkDev *dev, struct blkp_req **req) {
     struct blkp_req *elem;
     elem = TAILQ_FIRST(&dev->procq);
     if (elem == NULL) {
@@ -53,7 +53,7 @@ static int get_breq(BlkDev *dev, struct blkp_req **req) {
     return 1;
 }
 
-static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
+static void virtio_blk_process_request(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
     struct iovec *iov = req->iov;
     int n = req->iovcnt, err = 0;
     ssize_t len, written_len = 0;
@@ -92,22 +92,22 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
         err = EOPNOTSUPP;
         break;
     }
-    complete_block_operation(dev, req, vq, err, written_len);
+    virtio_blk_complete_request(dev, req, vq, err, written_len);
 }
 
-// Every virtio-blk has a blkproc_thread that is used for reading and writing.
-static void *blkproc_thread(void *arg) {
+// Every virtio-blk has a virtio_blk_worker_thread that is used for reading and writing.
+static void *virtio_blk_worker_thread(void *arg) {
     VirtIODevice *vdev = arg;
     BlkDev *dev = vdev->dev;
     struct blkp_req *breq;
-    // get_breq will access the critical section, so lock it.
+    // virtio_blk_get_request will access the critical section, so lock it.
     pthread_mutex_lock(&dev->mtx);
 
     for (;;) {
-        while (get_breq(dev, &breq)) {
+        while (virtio_blk_get_request(dev, &breq)) {
             // blk_proc don't access the critical section, so unlock.
             pthread_mutex_unlock(&dev->mtx);
-            blkproc(dev, breq, vdev->vqs);
+            virtio_blk_process_request(dev, breq, vdev->vqs);
             pthread_mutex_lock(&dev->mtx);
         }
 
@@ -122,7 +122,7 @@ static void *blkproc_thread(void *arg) {
 }
 
 // create blk dev.
-BlkDev *init_blk_dev(VirtIODevice *vdev) {
+BlkDev *virtio_blk_alloc_dev(VirtIODevice *vdev) {
     BlkDev *dev = malloc(sizeof(BlkDev));
     vdev->dev = dev;
     dev->config.capacity = -1;
@@ -134,7 +134,7 @@ BlkDev *init_blk_dev(VirtIODevice *vdev) {
     pthread_mutex_init(&dev->mtx, NULL);
     pthread_cond_init(&dev->cond, NULL);
     TAILQ_INIT(&dev->procq);
-    pthread_create(&dev->tid, NULL, blkproc_thread, vdev);
+    pthread_create(&dev->tid, NULL, virtio_blk_worker_thread, vdev);
     return dev;
 }
 
@@ -164,8 +164,8 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
 }
 
 // handle one descriptor list
-static struct blkp_req *virtq_blk_handle_one_request(VirtQueue *vq) {
-    log_debug("virtq_blk_handle_one_request enter");
+static struct blkp_req *virtio_blk_handle_request(VirtQueue *vq) {
+    log_debug("virtio_blk_handle_request enter");
     struct blkp_req *breq;
     struct iovec *iov = NULL;
     uint16_t *flags;
@@ -229,7 +229,7 @@ int virtio_blk_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     while (!virtqueue_is_empty(vq)) {
         virtqueue_disable_notify(vq);
         while (!virtqueue_is_empty(vq)) {
-            breq = virtq_blk_handle_one_request(vq);
+            breq = virtio_blk_handle_request(vq);
             TAILQ_INSERT_TAIL(&procq, breq, link);
         }
         virtqueue_enable_notify(vq);

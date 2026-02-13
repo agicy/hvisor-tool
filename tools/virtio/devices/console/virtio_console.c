@@ -23,7 +23,7 @@
 
 static uint8_t trashbuf[1024];
 
-ConsoleDev *init_console_dev() {
+ConsoleDev *virtio_console_alloc_dev() {
     ConsoleDev *dev = (ConsoleDev *)malloc(sizeof(ConsoleDev));
     dev->config.cols = 80;
     dev->config.rows = 25;
@@ -147,7 +147,7 @@ int virtio_console_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     return 0;
 }
 
-static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
+static void virtio_console_handle_tx_request(ConsoleDev *dev, VirtQueue *vq) {
     int n;
     uint16_t idx;
     ssize_t len;
@@ -176,7 +176,7 @@ int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     while (!virtqueue_is_empty(vq)) {
         virtqueue_disable_notify(vq);
         while (!virtqueue_is_empty(vq)) {
-            virtq_tx_handle_one_request(vdev->dev, vq);
+            virtio_console_handle_tx_request(vdev->dev, vq);
         }
         virtqueue_enable_notify(vq);
     }

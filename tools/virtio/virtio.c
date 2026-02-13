@@ -189,7 +189,7 @@ VirtIODevice *create_virtio_device(VirtioDeviceType dev_type, uint32_t zone_id,
     switch (dev_type) {
     case VirtioTBlock:
         vdev->regs.dev_feature = BLK_SUPPORTED_FEATURES;
-        init_blk_dev(vdev);
+        virtio_blk_alloc_dev(vdev);
         init_virtio_queue(vdev, dev_type);
         log_info("debug: init_blk_dev and init_virtio_queue finished\n");
         is_err = virtio_blk_init(vdev, (const char *)arg0);
@@ -197,14 +197,14 @@ VirtIODevice *create_virtio_device(VirtioDeviceType dev_type, uint32_t zone_id,
 
     case VirtioTNet:
         vdev->regs.dev_feature = NET_SUPPORTED_FEATURES;
-        vdev->dev = init_net_dev(arg0);
+        vdev->dev = virtio_net_alloc_dev(arg0);
         init_virtio_queue(vdev, dev_type);
         is_err = virtio_net_init(vdev, (char *)arg1);
         break;
 
     case VirtioTConsole:
         vdev->regs.dev_feature = CONSOLE_SUPPORTED_FEATURES;
-        vdev->dev = init_console_dev();
+        vdev->dev = virtio_console_alloc_dev();
         init_virtio_queue(vdev, dev_type);
         is_err = virtio_console_init(vdev);
         break;
