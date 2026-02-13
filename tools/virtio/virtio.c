@@ -39,7 +39,6 @@
 int ko_fd;
 volatile struct virtio_bridge *virtio_bridge;
 
-pthread_mutex_t RES_MUTEX = PTHREAD_MUTEX_INITIALIZER;
 VirtIODevice *vdevs[MAX_DEVS];
 int vdevs_num;
 
@@ -267,6 +266,7 @@ void init_virtio_queue(VirtIODevice *vdev, VirtioDeviceType type) {
         vqs->notify_handler = virtio_blk_notify_handler;
         vqs->dev = vdev;
         vdev->vqs = vqs;
+        vdev->queue_resize = virtio_blk_queue_resize;
         break;
 
     case VirtioTNet:
@@ -280,6 +280,7 @@ void init_virtio_queue(VirtIODevice *vdev, VirtioDeviceType type) {
         vqs[NET_QUEUE_RX].notify_handler = virtio_net_rxq_notify_handler;
         vqs[NET_QUEUE_TX].notify_handler = virtio_net_txq_notify_handler;
         vdev->vqs = vqs;
+        vdev->queue_resize = virtio_net_queue_resize;
         break;
 
     case VirtioTConsole:
@@ -295,6 +296,7 @@ void init_virtio_queue(VirtIODevice *vdev, VirtioDeviceType type) {
         vqs[CONSOLE_QUEUE_TX].notify_handler =
             virtio_console_txq_notify_handler;
         vdev->vqs = vqs;
+        vdev->queue_resize = virtio_console_queue_resize;
         break;
 
     case VirtioTGPU:
@@ -352,7 +354,6 @@ void virtqueue_reset(VirtQueue *vq, int idx) {
     vq->notify_handler = addr;
     vq->dev = dev;
     vq->queue_num_max = queue_num_max;
-    pthread_mutex_init(&vq->used_ring_lock, NULL);
 }
 
 // check if virtqueue has new requests
@@ -529,6 +530,84 @@ int process_descriptor_chain(VirtQueue *vq, uint16_t *desc_idx,
         } else {
             // For a normal descriptor, copy it directly to iov
             descriptor2iov(i, vdesc, *iov, flags == NULL ? NULL : *flags,
+                           vq->dev->zone_id, copy_flags);
+        }
+    }
+    return chain_len;
+}
+
+/// record one descriptor list to iov (no allocation)
+/// \param desc_idx the first descriptor's idx in descriptor list.
+/// \param iov the iov buffer provided by caller
+/// \param iov_len the size of iov buffer
+/// \param flags the flags buffer provided by caller (can be NULL)
+/// \param append_len the number of iovs to append (reserved space check)
+/// \return the len of iovs filled, or -1 on error (buffer too small)
+int process_descriptor_chain_into(VirtQueue *vq, uint16_t *desc_idx,
+                                  struct iovec *iov, int iov_len,
+                                  uint16_t *flags, int append_len,
+                                  bool copy_flags) {
+    uint16_t next, last_avail_idx;
+    volatile VirtqDesc *vdesc, *ind_table, *ind_desc;
+    int chain_len = 0, i, table_len;
+
+    // idx is the last available index processed during the last kick
+    last_avail_idx = vq->last_avail_idx;
+
+    // No new requests
+    if (last_avail_idx == vq->avail_ring->idx)
+        return 0;
+
+    // Update to the index to be processed during this kick
+    vq->last_avail_idx++;
+
+    // Get the index of the first available descriptor
+    *desc_idx = next = vq->avail_ring->ring[last_avail_idx & (vq->num - 1)];
+    // Record the length of the descriptor chain to chain_len
+    for (i = 0; i < (int)vq->num; i++, next = vdesc->next) {
+        // Get a descriptor
+        vdesc = &vq->desc_table[next];
+
+        if (vdesc->flags & VRING_DESC_F_INDIRECT) {
+            chain_len += vdesc->len / 16;
+            i--;
+        }
+        if ((vdesc->flags & VRING_DESC_F_NEXT) == 0)
+            break;
+    }
+
+    // Update chain length and reset next to the first descriptor
+    chain_len += i + 1;
+    next = *desc_idx;
+
+    if (chain_len + append_len > iov_len) {
+        log_error("iov buffer too small: need %d, have %d", chain_len + append_len, iov_len);
+        // Rollback last_avail_idx because we failed to process this one?
+        // Or just let caller handle it. Usually fatal.
+        return -1;
+    }
+
+    // Traverse the descriptor chain and copy the buffer pointed to by each
+    // descriptor to iov
+    for (i = 0; i < chain_len; i++, next = vdesc->next) {
+        vdesc = &vq->desc_table[next];
+        if (vdesc->flags & VRING_DESC_F_INDIRECT) {
+            ind_table = (VirtqDesc *)(get_virt_addr((void *)vdesc->addr,
+                                                    vq->dev->zone_id));
+            table_len = vdesc->len / 16;
+            next = 0;
+            for (;;) {
+                ind_desc = &ind_table[next];
+                descriptor2iov(i, ind_desc, iov, flags == NULL ? NULL : flags,
+                               vq->dev->zone_id, copy_flags);
+                table_len--;
+                i++;
+                if ((ind_desc->flags & VRING_DESC_F_NEXT) == 0)
+                    break;
+                next = ind_desc->next;
+            }
+        } else {
+            descriptor2iov(i, vdesc, iov, flags == NULL ? NULL : flags,
                            vq->dev->zone_id, copy_flags);
         }
     }
@@ -799,6 +878,11 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
                   value);
 
         vqs[regs->queue_sel].num = value;
+
+        // Use handler to resize queue contexts if needed
+        if (vdev->queue_resize) {
+            vdev->queue_resize(vdev, regs->queue_sel, value);
+        }
         break;
     case VIRTIO_MMIO_QUEUE_READY:
         log_debug("write VIRTIO_MMIO_QUEUE_READY");
@@ -927,7 +1011,7 @@ void virtio_inject_irq(VirtQueue *vq) {
     // Since the shared resources related to res_list are only accessed
     //  at one specific code location, a lock before polling is_queue_full
     //  is enough to ensure thread safety and performance.
-    pthread_mutex_lock(&RES_MUTEX);
+    // pthread_mutex_lock(&RES_MUTEX);
 
     while (is_queue_full(virtio_bridge->res_front, virtio_bridge->res_rear,
                          MAX_REQ)) {
@@ -941,7 +1025,7 @@ void virtio_inject_irq(VirtQueue *vq) {
     write_barrier();
     vq->dev->regs.interrupt_status = VIRTIO_MMIO_INT_VRING;
     vq->dev->regs.interrupt_count++;
-    pthread_mutex_unlock(&RES_MUTEX);
+    // pthread_mutex_unlock(&RES_MUTEX);
     log_debug("inject irq to device %s, vq is %d",
               virtio_device_type_to_string(vq->dev->type), vq->vq_idx);
     ioctl(ko_fd, HVISOR_FINISH_REQ);
@@ -1015,64 +1099,6 @@ void virtio_close() {
     log_warn("virtio daemon exit successfully");
 }
 
-void handle_virtio_requests() {
-    int sig;
-    sigset_t wait_set;
-    struct timespec timeout;
-    unsigned int req_front = virtio_bridge->req_front;
-    volatile struct device_req *req;
-    timeout.tv_sec = 0;
-    timeout.tv_nsec = WAIT_TIME;
-    sigemptyset(&wait_set);
-    sigaddset(&wait_set, SIGHVI);
-    sigaddset(&wait_set, SIGTERM);
-    virtio_bridge->need_wakeup = 1;
-
-    int signal_count = 0, proc_count = 0;
-    unsigned long long count = 0;
-    for (;;) {
-#ifndef LOONGARCH64
-        log_warn("signal_count is %d, proc_count is %d", signal_count,
-                 proc_count);
-        sigwait(&wait_set, &sig); // change to no signal irq
-        signal_count++;
-        if (sig == SIGTERM) {
-            virtio_close();
-            break;
-        } else if (sig != SIGHVI) {
-            log_error("unknown signal %d", sig);
-            continue;
-        }
-#endif
-        while (1) {
-            if (!is_queue_empty(req_front, virtio_bridge->req_rear)) {
-                count = 0;
-                proc_count++;
-                req = &virtio_bridge->req_list[req_front];
-                virtio_bridge->need_wakeup = 0;
-                virtio_handle_req(req);
-                req_front = (req_front + 1) & (MAX_REQ - 1);
-                virtio_bridge->req_front = req_front;
-                write_barrier();
-            }
-#ifndef LOONGARCH64
-            else {
-                count++;
-                if (count < 10000000)
-                    continue;
-                count = 0;
-                virtio_bridge->need_wakeup = 1;
-                write_barrier();
-                nanosleep(&timeout, NULL);
-                if (is_queue_empty(req_front, virtio_bridge->req_rear)) {
-                    break;
-                }
-            }
-#endif
-        }
-    }
-}
-
 void initialize_log() {
     int log_level;
 #ifdef HLOG
@@ -1124,7 +1150,10 @@ int virtio_init() {
     }
 
     // Initialize event_monitor used by console and net devices
-    initialize_event_monitor();
+    if (initialize_event_monitor() < 0) {
+        log_error("initialize_event_monitor failed");
+        goto unmap;
+    }
     log_info("hvisor init okay!");
     return 0;
 unmap:
@@ -1336,7 +1365,7 @@ int virtio_start(int argc, char *argv[]) {
     virtio_bridge->mmio_avail = 1;
     write_barrier();
 
-    handle_virtio_requests(); // Handle virtio requests
+    monitor_loop(); // Handle virtio requests
     return 0;
 err_out:
     virtio_close();

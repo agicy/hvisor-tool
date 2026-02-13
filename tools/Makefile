@@ -46,7 +46,7 @@ ifeq ($(LIBC), musl)
 include_dirs += -I./compat/
 endif
 
-LDFLAGS := -lpthread -static
+LDFLAGS := -lpthread -luring -static
 
 ifeq ($(VIRTIO_GPU), y)
 	CFLAGS += -DENABLE_VIRTIO_GPU

@@ -15,7 +15,6 @@
 #include <linux/virtio_config.h>
 #include <linux/virtio_mmio.h>
 #include <linux/virtio_ring.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/uio.h>
@@ -102,7 +101,6 @@ struct VirtQueue {
                                // the frontend driver of the backend processing
                                // progress Enabling this feature will change the
                                // flags field of the avail_ring
-    pthread_mutex_t used_ring_lock; // Used ring lock
 };
 
 // The highest abstruct representations of virtio device
@@ -126,6 +124,7 @@ struct VirtIODevice {
               // is ConsoleDev Pointer to the specific device's special config
     void (*virtio_close)(
         VirtIODevice *vdev); // Function called when closing the virtio device
+    int (*queue_resize)(VirtIODevice *vdev, int queue_idx, int new_num);
     bool activated;          // Whether the current virtio device is activated
 };
 
@@ -190,6 +189,11 @@ int descriptor2iov(int i, volatile VirtqDesc *vd, struct iovec *iov,
 int process_descriptor_chain(VirtQueue *vq, uint16_t *desc_idx,
                              struct iovec **iov, uint16_t **flags,
                              int append_len, bool copy_flags);
+
+int process_descriptor_chain_into(VirtQueue *vq, uint16_t *desc_idx,
+                                  struct iovec *iov, int iov_len,
+                                  uint16_t *flags, int append_len,
+                                  bool copy_flags);
 
 void update_used_ring(VirtQueue *vq, uint16_t idx, uint32_t iolen);
 

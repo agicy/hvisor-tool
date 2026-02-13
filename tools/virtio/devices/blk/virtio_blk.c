@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /**
- * Copyright (c) 2025 Syswonder
- *
- * Syswonder Website:
- *      https://www.syswonder.org
- *
- * Authors:
- *      Guowei Li <2401213322@stu.pku.edu.cn>
- */
+ * Copyright (c) 2025 Syswonder
+ *
+ * Syswonder Website:
+ *      https://www.syswonder.org
+ *
+ * Authors:
+ *      Guowei Li <2401213322@stu.pku.edu.cn>
+ */
 #include "virtio_blk.h"
 #include "log.h"
 #include "virtio.h"
+#include "event_monitor.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -18,107 +19,69 @@
 #include <sys/param.h>
 #include <sys/stat.h>
 
-static void virtio_blk_complete_request(BlkDev *dev, struct blkp_req *req,
-                                     VirtQueue *vq, int err,
-                                     ssize_t written_len) {
+static void virtio_blk_completion_callback(void *param, int res) {
+    struct blkp_req *req = param;
+    BlkDev *dev = req->dev;
+    VirtQueue *vq = req->vq;
+    ssize_t written_len = 0;
+    int err = 0;
+
+    if (res < 0) {
+        log_error("virt blk async io error: %d", res);
+        err = -res;
+    } else {
+        if (req->type == VIRTIO_BLK_T_IN) {
+            written_len = res;
+        }
+    }
+
     uint8_t *vstatus = (uint8_t *)(req->iov[req->iovcnt - 1].iov_base);
-    int is_empty = 0;
     if (err == EOPNOTSUPP)
         *vstatus = VIRTIO_BLK_S_UNSUPP;
     else if (err != 0)
         *vstatus = VIRTIO_BLK_S_IOERR;
     else
         *vstatus = VIRTIO_BLK_S_OK;
-    if (err != 0) {
-        log_error("virt blk err, num is %d", err);
-    }
-    update_used_ring(vq, req->idx, written_len + 1);
-    pthread_mutex_lock(&dev->mtx);
-    is_empty = TAILQ_EMPTY(&dev->procq);
-    pthread_mutex_unlock(&dev->mtx);
-    if (is_empty)
-        virtio_inject_irq(vq);
-    free(req->iov);
-    free(req);
-}
-// get a blk req from procq
-static int virtio_blk_get_request(BlkDev *dev, struct blkp_req **req) {
-    struct blkp_req *elem;
-    elem = TAILQ_FIRST(&dev->procq);
-    if (elem == NULL) {
-        return 0;
-    }
-    TAILQ_REMOVE(&dev->procq, elem, link);
-    *req = elem;
-    return 1;
+
+    update_used_ring(vq, req->idx, (req->type == VIRTIO_BLK_T_IN ? written_len : 0) + 1);
+    
+    // In single-threaded mode, we inject IRQ immediately if needed or at the end of loop
+    virtio_inject_irq(vq);
+
+    // No free(req->iov) or free(req) as they are preallocated
 }
 
-static void virtio_blk_process_request(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
+static void virtio_blk_process_request_async(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
     struct iovec *iov = req->iov;
-    int n = req->iovcnt, err = 0;
-    ssize_t len, written_len = 0;
+    int n = req->iovcnt;
+    req->dev = dev;
+    req->vq = vq;
 
     switch (req->type) {
     case VIRTIO_BLK_T_IN:
-        written_len = len = preadv(dev->img_fd, &iov[1], n - 2, req->offset);
-        // log_debug("readv data is ");
-        // for(int i = 1; i < n-1; i++) {
-        //     log_debug("n-1 is %d, iov[i].iov_len is %d", n-1,
-        //     iov[i].iov_len); for (int j = 0; j < iov[i].iov_len; j++)
-        //         printf("%x", *(int*)(iov[i].iov_base + j));
-        //     printf("\n");
-        // }
-        log_debug("preadv, len is %d, offset is %d", len, req->offset);
-        if (len < 0) {
-            log_error("pread failed");
-            err = errno;
+        if (submit_async_readv_prealloc(dev->img_fd, &iov[1], n - 2, req->offset, virtio_blk_completion_callback, req, &req->req_data) < 0) {
+            log_error("Failed to submit async read for blk");
+            virtio_blk_completion_callback(req, -EIO);
         }
         break;
     case VIRTIO_BLK_T_OUT:
-        len = pwritev(dev->img_fd, &iov[1], n - 2, req->offset);
-        log_debug("pwritev, len is %d, offset is %d", len, req->offset);
-        if (len < 0) {
-            log_error("pwrite failed");
-            err = errno;
+        if (submit_async_writev_prealloc(dev->img_fd, &iov[1], n - 2, req->offset, virtio_blk_completion_callback, req, &req->req_data) < 0) {
+            log_error("Failed to submit async write for blk");
+            virtio_blk_completion_callback(req, -EIO);
         }
         break;
     case VIRTIO_BLK_T_GET_ID: {
         char s[20] = "hvisor-virblk";
         strncpy(iov[1].iov_base, s, MIN(sizeof(s), iov[1].iov_len));
+        // Synchronous completion for GET_ID as it's just memory copy
+        virtio_blk_completion_callback(req, 0);
         break;
     }
     default:
         log_fatal("Operation is not supported");
-        err = EOPNOTSUPP;
+        virtio_blk_completion_callback(req, -EOPNOTSUPP);
         break;
     }
-    virtio_blk_complete_request(dev, req, vq, err, written_len);
-}
-
-// Every virtio-blk has a virtio_blk_worker_thread that is used for reading and writing.
-static void *virtio_blk_worker_thread(void *arg) {
-    VirtIODevice *vdev = arg;
-    BlkDev *dev = vdev->dev;
-    struct blkp_req *breq;
-    // virtio_blk_get_request will access the critical section, so lock it.
-    pthread_mutex_lock(&dev->mtx);
-
-    for (;;) {
-        while (virtio_blk_get_request(dev, &breq)) {
-            // blk_proc don't access the critical section, so unlock.
-            pthread_mutex_unlock(&dev->mtx);
-            virtio_blk_process_request(dev, breq, vdev->vqs);
-            pthread_mutex_lock(&dev->mtx);
-        }
-
-        if (dev->close) {
-            pthread_mutex_unlock(&dev->mtx);
-            break;
-        }
-        pthread_cond_wait(&dev->cond, &dev->mtx);
-    }
-    pthread_exit(NULL);
-    return NULL;
 }
 
 // create blk dev.
@@ -130,22 +93,21 @@ BlkDev *virtio_blk_alloc_dev(VirtIODevice *vdev) {
     dev->config.seg_max = BLK_SEG_MAX;
     dev->img_fd = -1;
     dev->close = 0;
-    // TODO: chang to thread poll
-    pthread_mutex_init(&dev->mtx, NULL);
-    pthread_cond_init(&dev->cond, NULL);
-    TAILQ_INIT(&dev->procq);
-    pthread_create(&dev->tid, NULL, virtio_blk_worker_thread, vdev);
+    // Initial alloc
+    dev->reqs = calloc(VIRTQUEUE_BLK_MAX_SIZE, sizeof(struct blkp_req));
     return dev;
 }
 
 int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
-    int img_fd = open(img_path, O_RDWR);
+    int img_fd = open(img_path, O_RDWR /*| O_DIRECT*/); // Use O_DIRECT for io_uring if possible, or just O_RDWR
+    if (img_fd == -1) {
+        img_fd = open(img_path, O_RDWR); // Fallback
+    }
     BlkDev *dev = vdev->dev;
     struct stat st;
     uint64_t blk_size;
     if (img_fd == -1) {
         log_error("cannot open %s, Error code is %d", img_path, errno);
-        close(img_fd);
         return -1;
     }
     if (fstat(img_fd, &st) == -1) {
@@ -165,96 +127,111 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
 
 // handle one descriptor list
 static struct blkp_req *virtio_blk_handle_request(VirtQueue *vq) {
-    log_debug("virtio_blk_handle_request enter");
+    BlkDev *dev = (BlkDev *)vq->dev->dev;
     struct blkp_req *breq;
-    struct iovec *iov = NULL;
-    uint16_t *flags;
     int i, n;
     BlkReqHead *hdr;
-    breq = malloc(sizeof(struct blkp_req));
-    n = process_descriptor_chain(vq, &breq->idx, &iov, &flags, 0, true);
-    breq->iov = iov;
+    uint16_t idx;
+    
+    // Use peek logic to determine which slot to use
+    uint16_t last_avail_idx = vq->last_avail_idx;
+    uint16_t head_idx = vq->avail_ring->ring[last_avail_idx & (vq->num - 1)];
+    if (head_idx >= vq->num) {
+        log_error("head_idx %d out of bounds (queue num %d)", head_idx, vq->num);
+        return NULL;
+    }
+
+    breq = &dev->reqs[head_idx];
+    
+    // Use process_descriptor_chain_into with preallocated iov and flags
+    n = process_descriptor_chain_into(vq, &breq->idx, breq->iov, BLK_SEG_MAX + 2, breq->flags, 0, true);
+    
     if (n < 2 || n > BLK_SEG_MAX + 2) {
         log_error("iov's num is wrong, n is %d", n);
-        goto err_out;
+        if (n == -1) {
+            update_used_ring(vq, breq->idx, 0);
+            virtio_inject_irq(vq);
+        }
+        return NULL;
     }
 
-    if ((flags[0] & VRING_DESC_F_WRITE) != 0) {
+    if ((breq->flags[0] & VRING_DESC_F_WRITE) != 0) {
         log_error("virt queue's desc chain header should not be writable!");
-        goto err_out;
+        update_used_ring(vq, breq->idx, 0);
+        virtio_inject_irq(vq);
+        return NULL;
     }
 
-    if (iov[0].iov_len != sizeof(BlkReqHead)) {
+    if (breq->iov[0].iov_len != sizeof(BlkReqHead)) {
         log_error("the size of blk header is %d, it should be %d!",
-                  iov[0].iov_len, sizeof(BlkReqHead));
-        goto err_out;
+                  breq->iov[0].iov_len, sizeof(BlkReqHead));
+        update_used_ring(vq, breq->idx, 0);
+        virtio_inject_irq(vq);
+        return NULL;
     }
 
-    if (iov[n - 1].iov_len != 1 || ((flags[n - 1] & VRING_DESC_F_WRITE) == 0)) {
+    if (breq->iov[n - 1].iov_len != 1 || ((breq->flags[n - 1] & VRING_DESC_F_WRITE) == 0)) {
         log_error(
             "status iov is invalid!, status len is %d, flag is %d, n is %d",
-            iov[n - 1].iov_len, flags[n - 1], n);
-        goto err_out;
+            breq->iov[n - 1].iov_len, breq->flags[n - 1], n);
+        update_used_ring(vq, breq->idx, 0);
+        virtio_inject_irq(vq);
+        return NULL;
     }
 
-    hdr = (BlkReqHead *)(iov[0].iov_base);
+    hdr = (BlkReqHead *)(breq->iov[0].iov_base);
     uint64_t offset = hdr->sector * SECTOR_BSIZE;
     breq->type = hdr->type;
     breq->iovcnt = n;
     breq->offset = offset;
 
     for (i = 1; i < n - 1; i++)
-        if (((flags[i] & VRING_DESC_F_WRITE) == 0) !=
+        if (((breq->flags[i] & VRING_DESC_F_WRITE) == 0) !=
             (breq->type == VIRTIO_BLK_T_OUT)) {
             log_error("flag is conflict with operation");
-            goto err_out;
+            return NULL;
         }
 
-    free(flags);
     return breq;
-
-err_out:
-    free(flags);
-    free(iov);
-    free(breq);
-    return NULL;
 }
 
 int virtio_blk_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
-    log_debug("virtio blk notify handler enter");
-    BlkDev *blkDev = (BlkDev *)vdev->dev;
+    BlkDev *dev = (BlkDev *)vdev->dev;
     struct blkp_req *breq;
-    TAILQ_HEAD(, blkp_req) procq;
-    TAILQ_INIT(&procq);
     while (!virtqueue_is_empty(vq)) {
         virtqueue_disable_notify(vq);
         while (!virtqueue_is_empty(vq)) {
             breq = virtio_blk_handle_request(vq);
-            TAILQ_INSERT_TAIL(&procq, breq, link);
+            if (breq) {
+                virtio_blk_process_request_async(dev, breq, vq);
+            }
         }
         virtqueue_enable_notify(vq);
     }
-    if (TAILQ_EMPTY(&procq)) {
-        log_debug("virtio blk notify handler exit, procq is empty");
-        return 0;
+    io_flush(); // Batch submit all async requests
+    return 0;
+}
+
+int virtio_blk_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num) {
+    BlkDev *dev = vdev->dev;
+    if (new_num > VIRTQUEUE_BLK_MAX_SIZE) {
+        log_info("Resizing Blk Queue contexts to %d", new_num);
+        struct blkp_req *new_reqs = realloc(dev->reqs, sizeof(struct blkp_req) * new_num);
+        if (new_reqs) {
+            dev->reqs = new_reqs;
+        } else {
+            log_error("Failed to realloc blk queue contexts");
+            return -1;
+        }
     }
-    pthread_mutex_lock(&blkDev->mtx);
-    TAILQ_CONCAT(&blkDev->procq, &procq, link);
-    pthread_cond_signal(&blkDev->cond);
-    pthread_mutex_unlock(&blkDev->mtx);
     return 0;
 }
 
 void virtio_blk_close(VirtIODevice *vdev) {
     BlkDev *dev = vdev->dev;
-    pthread_mutex_lock(&dev->mtx);
     dev->close = 1;
-    pthread_cond_signal(&dev->cond);
-    pthread_mutex_unlock(&dev->mtx);
-    pthread_join(dev->tid, NULL);
-    pthread_mutex_destroy(&dev->mtx);
-    pthread_cond_destroy(&dev->cond);
     close(dev->img_fd);
+    free(dev->reqs);
     free(dev);
     free(vdev->vqs);
     free(vdev);

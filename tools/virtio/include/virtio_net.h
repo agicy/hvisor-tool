@@ -21,7 +21,9 @@
 // Maximum number of queues for Virtio net
 #define NET_MAX_QUEUES 2
 
-#define VIRTQUEUE_NET_MAX_SIZE 256
+#define VIRTQUEUE_NET_MAX_SIZE 1024
+#define NET_IOV_MAX 64
+
 // VIRTIO_RING_F_INDIRECT_DESC and VIRTIO_RING_F_EVENT_IDX are supported, for
 // some reason we cancel them.
 #define NET_SUPPORTED_FEATURES                                                 \
@@ -31,17 +33,42 @@
 typedef struct virtio_net_config NetConfig;
 typedef struct virtio_net_hdr_v1 NetHdr;
 typedef struct virtio_net_hdr NetHdrLegacy;
+
+struct net_rx_ctx {
+    VirtQueue *vq;
+    uint16_t idx;
+    struct iovec iov[NET_IOV_MAX];
+    int iovcnt;
+    void *vnet_header;
+    size_t header_len;
+    VirtIODevice *vdev;
+    struct request_data req_data;
+};
+
+struct net_tx_ctx {
+    VirtQueue *vq;
+    uint16_t idx;
+    struct iovec iov[NET_IOV_MAX];
+    int iovcnt;
+    struct request_data req_data;
+};
+
 typedef struct virtio_net_dev {
     NetConfig config;
     int tapfd;
     int rx_ready;
-    struct hvisor_event *event;
+    int pending_rx;
+    bool rx_poll_active;
+    struct net_rx_ctx *rx_ctxs;
+    struct net_tx_ctx *tx_ctxs;
+    struct request_data poll_req;
 } NetDev;
 
 NetDev *virtio_net_alloc_dev(uint8_t mac[]);
 int virtio_net_init(VirtIODevice *vdev, char *devname);
 int virtio_net_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq);
 int virtio_net_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq);
+int virtio_net_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num);
 void virtio_net_close(VirtIODevice *vdev);
 
 #endif //_HVISOR_VIRTIO_NET_H

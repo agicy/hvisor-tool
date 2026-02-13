@@ -20,19 +20,41 @@
 #define VIRTQUEUE_CONSOLE_MAX_SIZE 64
 #define CONSOLE_QUEUE_RX 0
 #define CONSOLE_QUEUE_TX 1
+#define CONSOLE_IOV_MAX 16
+
+struct console_read_ctx {
+    VirtQueue *vq;
+    uint16_t idx;
+    struct iovec iov[CONSOLE_IOV_MAX];
+    int iovcnt;
+    struct request_data req_data;
+};
+
+struct console_tx_ctx {
+    VirtQueue *vq;
+    uint16_t idx;
+    struct iovec iov[CONSOLE_IOV_MAX];
+    int iovcnt;
+    struct request_data req_data;
+};
 
 typedef struct virtio_console_config ConsoleConfig;
 typedef struct virtio_console_dev {
     ConsoleConfig config;
     int master_fd;
     int rx_ready;
-    struct hvisor_event *event;
+    int pending_rx;
+    bool rx_poll_active;
+    struct console_read_ctx *rx_ctxs;
+    struct console_tx_ctx *tx_ctxs;
+    struct request_data poll_req;
 } ConsoleDev;
 
 ConsoleDev *virtio_console_alloc_dev();
 int virtio_console_init(VirtIODevice *vdev);
 int virtio_console_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq);
 int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq);
+int virtio_console_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num);
 void virtio_console_close(VirtIODevice *vdev);
 
 #endif
