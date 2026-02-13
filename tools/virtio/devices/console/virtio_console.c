@@ -40,6 +40,7 @@ ConsoleDev *virtio_console_alloc_dev() {
     dev->rx_poll_active = false;
     dev->rx_ctxs = calloc(VIRTQUEUE_CONSOLE_MAX_SIZE, sizeof(struct console_read_ctx));
     dev->tx_ctxs = calloc(VIRTQUEUE_CONSOLE_MAX_SIZE, sizeof(struct console_tx_ctx));
+    dev->stalled_read_ctx = NULL;
     return dev;
 }
 
@@ -69,8 +70,9 @@ static void virtio_console_async_read_done(void *param, int res) {
         virtio_inject_irq(vq);
     } else {
         // EOF or EAGAIN (0 or negative)
-        // Back off last_avail_idx if we didn't use the buffer
-        vq->last_avail_idx--;
+        // Store the context as stalled, do not update ring, do not rollback last_avail_idx
+        log_debug("Console read EAGAIN, stalling context");
+        dev->stalled_read_ctx = ctx;
     }
 
     // No need to free iov or ctx as they are statically allocated
@@ -79,7 +81,7 @@ static void virtio_console_async_read_done(void *param, int res) {
     dev->pending_rx--;
     if (dev->pending_rx <= 0) {
         dev->pending_rx = 0; // Safety
-        if (virtqueue_is_empty(vq)) {
+        if (virtqueue_is_empty(vq) && !dev->stalled_read_ctx) {
             dev->rx_poll_active = false;
         } else if (!dev->rx_poll_active) {
             // Only re-arm if not already active
@@ -117,14 +119,32 @@ static void virtio_console_event_handler(int fd, void *param) {
     // Reset poll active flag because the poll event has triggered
     dev->rx_poll_active = false;
 
+    // Handle stalled context first if any
+    if (dev->stalled_read_ctx) {
+        struct console_read_ctx *ctx = dev->stalled_read_ctx;
+        dev->stalled_read_ctx = NULL;
+        int ret = submit_async_readv_prealloc(dev->master_fd, ctx->iov, ctx->iovcnt, 0, virtio_console_async_read_done, ctx, &ctx->req_data);
+        if (ret < 0) {
+            log_error("Failed to resubmit stalled read for console: %d", ret);
+            update_used_ring(vq, ctx->idx, 0);
+            virtio_inject_irq(vq);
+        } else {
+            dev->pending_rx++;
+        }
+        // If we processed a stalled request, we might want to return or continue.
+    // If we assume single-threaded and batching, we can continue to fill more if available.
+    // But for safety and simplicity with EAGAIN logic, let's process one batch or just return if pending > 0?
+    // Let's continue to fill pipeline if possible.
+    }
+
     if (dev->rx_ready <= 0) {
-        read(dev->master_fd, trashbuf, sizeof(trashbuf));
-        // Re-arm poll
-        add_event_read_prealloc(dev->master_fd, virtio_console_event_handler, vdev, &dev->poll_req);
-        dev->rx_poll_active = true;
+        // Stop polling to implement backpressure.
+        // When the driver provides buffers (via notify), we will re-arm the poll.
+        log_trace("Console rx not ready, pausing poll");
+        dev->rx_poll_active = false;
         return;
     }
-    if (virtqueue_is_empty(vq)) {
+    if (virtqueue_is_empty(vq) && dev->pending_rx == 0) { // Check pending_rx to avoid premature sleep if stalled was submitted
         // Already set to false above
         virtio_inject_irq(vq);
         return;
@@ -206,16 +226,16 @@ static void virtio_console_event_handler(int fd, void *param) {
         loop_count++;
     }
 
-    if (loop_count > 0) {
+        if (loop_count > 0) {
         io_flush();
         // Pipeline optimization: if we still have buffers, re-arm poll immediately
         // instead of waiting for all IOs to complete.
-        if (!dev->rx_poll_active && !virtqueue_is_empty(vq)) {
+        if (!dev->rx_poll_active && (!virtqueue_is_empty(vq) || dev->stalled_read_ctx)) {
             add_event_read_prealloc(dev->master_fd, virtio_console_event_handler, vdev, &dev->poll_req);
             dev->rx_poll_active = true;
         }
     } else {
-        if (dev->pending_rx == 0) {
+        if (dev->pending_rx == 0 && !dev->stalled_read_ctx) {
              add_event_read_prealloc(dev->master_fd, virtio_console_event_handler, vdev, &dev->poll_req);
              dev->rx_poll_active = true;
         }

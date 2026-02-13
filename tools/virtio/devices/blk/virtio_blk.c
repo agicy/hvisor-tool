@@ -27,6 +27,12 @@ static void virtio_blk_completion_callback(void *param, int res) {
     int err = 0;
 
     if (res < 0) {
+        if (res == -EAGAIN) {
+            // Retry the request
+            log_debug("virtio blk EAGAIN, retrying");
+            virtio_blk_process_request_async(dev, req, vq);
+            return;
+        }
         log_error("virt blk async io error: %d", res);
         err = -res;
     } else {

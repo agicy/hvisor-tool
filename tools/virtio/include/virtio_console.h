@@ -47,6 +47,7 @@ typedef struct virtio_console_dev {
     bool rx_poll_active;
     struct console_read_ctx *rx_ctxs;
     struct console_tx_ctx *tx_ctxs;
+    struct console_read_ctx *stalled_read_ctx;
     struct request_data poll_req;
 } ConsoleDev;
 

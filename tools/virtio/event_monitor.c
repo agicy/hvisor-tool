@@ -42,6 +42,7 @@ static struct request_data inject_req = {
 
 extern int ko_fd; // defined in hvisor.c or virtio.c
 extern volatile struct virtio_bridge *virtio_bridge;
+extern void virtio_close(void);
 
 void io_flush(void) {
     io_uring_submit(&ring);
@@ -83,32 +84,50 @@ static void handle_signal(int fd) {
     }
     if (fdsi.ssi_signo == SIGINT || fdsi.ssi_signo == SIGTERM) {
         log_info("Received signal %d, exiting...", fdsi.ssi_signo);
-        destroy_event_monitor();
+        virtio_close();
         exit(0);
     }
 }
 
-static void handle_eventfd(int fd) {
-    uint64_t u;
-    ssize_t s = read(fd, &u, sizeof(uint64_t));
-    if (s != sizeof(uint64_t)) {
-        log_error("read eventfd failed");
+static uint64_t irq_event_val;
+static struct iovec irq_event_iov = { .iov_base = &irq_event_val, .iov_len = sizeof(uint64_t) };
+
+static void handle_eventfd_async_done(void *param, int res) {
+    struct request_data *req = param;
+    
+    if (res < 0) {
+        if (res != -EAGAIN) {
+             log_error("read eventfd failed: %d", res);
+        }
+        // Resubmit read
+        submit_async_readv_prealloc(req->fd, &irq_event_iov, 1, 0, handle_eventfd_async_done, req, req);
         return;
     }
+    
+    if (res != sizeof(uint64_t)) {
+        // Should not happen for eventfd
+        log_error("read eventfd size mismatch: %d", res);
+        submit_async_readv_prealloc(req->fd, &irq_event_iov, 1, 0, handle_eventfd_async_done, req, req);
+        return;
+    }
+
     // Process requests from shared memory
     // Access virtio_bridge
     if (virtio_bridge) {
          unsigned int head = virtio_bridge->req_front;
          unsigned int tail = virtio_bridge->req_rear;
+         read_barrier();
          while (!is_queue_empty(head, tail)) {
              volatile struct device_req *req = &virtio_bridge->req_list[head];
              virtio_handle_req(req);
-             read_barrier();
              head = (head + 1) & (MAX_REQ - 1);
          }
-         virtio_bridge->req_front = head;
          write_barrier();
+         virtio_bridge->req_front = head;
     }
+    
+    // Resubmit read
+    submit_async_readv_prealloc(req->fd, &irq_event_iov, 1, 0, handle_eventfd_async_done, req, req);
 }
 
 int initialize_event_monitor(void) {
@@ -158,13 +177,17 @@ int initialize_event_monitor(void) {
     }
 
     struct request_data *evt_req = malloc(sizeof(struct request_data));
-    evt_req->type = REQ_TYPE_EVENTFD;
+    evt_req->type = REQ_TYPE_IO_READ; // Use IO_READ for async read
     evt_req->fd = irq_event_fd;
-    evt_req->dynamic = true;
-
-    sqe = get_sqe_safe();
-    io_uring_prep_poll_add(sqe, irq_event_fd, POLL_IN);
-    io_uring_sqe_set_data(sqe, evt_req);
+    evt_req->dynamic = true; // Or false if we want to manage it manually. 
+                             // Wait, submit_async_readv_prealloc sets dynamic=false.
+                             // But we malloc'ed it here.
+                             // If we use prealloc, we should NOT free it in loop.
+                             // Let's set dynamic = false but manage memory ourselves (it's persistent).
+                             // Actually, initialize_event_monitor mallocs it and it lives forever.
+                             
+    // Use submit_async_readv_prealloc to kick off the chain
+    submit_async_readv_prealloc(irq_event_fd, &irq_event_iov, 1, 0, handle_eventfd_async_done, evt_req, evt_req);
 
     // Setup irq inject fd
     irq_inject_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);

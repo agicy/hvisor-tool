@@ -51,6 +51,7 @@ NetDev *virtio_net_alloc_dev(uint8_t mac[]) {
     // Or better, alloc VIRTQUEUE_NET_MAX_SIZE for now as "supported max".
     dev->rx_ctxs = calloc(VIRTQUEUE_NET_MAX_SIZE, sizeof(struct net_rx_ctx));
     dev->tx_ctxs = calloc(VIRTQUEUE_NET_MAX_SIZE, sizeof(struct net_tx_ctx));
+    dev->stalled_read_ctx = NULL;
     return dev;
 }
 
@@ -163,8 +164,9 @@ static void virtio_net_async_rx_done(void *param, int res) {
         virtio_inject_irq(vq);
     } else {
         // EOF or EAGAIN
-        log_info("no more packets");
-        vq->last_avail_idx--;
+        // Store as stalled
+        log_debug("Net read EAGAIN, stalling context");
+        net->stalled_read_ctx = ctx;
     }
     
     // No free(ctx->iov) or free(ctx)
@@ -173,7 +175,7 @@ static void virtio_net_async_rx_done(void *param, int res) {
     net->pending_rx--;
     if (net->pending_rx <= 0) {
         net->pending_rx = 0; // Safety
-        if (virtqueue_is_empty(vq)) {
+        if (virtqueue_is_empty(vq) && !net->stalled_read_ctx) {
             net->rx_poll_active = false;
         } else if (!net->rx_poll_active) {
             // Only re-arm if not already active (avoid double poll)
@@ -211,6 +213,22 @@ static void virtio_net_event_handler(int fd, void *param) {
 
     // Reset poll active flag because the poll event has triggered
     net->rx_poll_active = false;
+
+    // Handle stalled context first if any
+    if (net->stalled_read_ctx) {
+        struct net_rx_ctx *ctx = net->stalled_read_ctx;
+        net->stalled_read_ctx = NULL;
+        
+        // Use effective_iov which was calculated and saved before stalling
+        int ret = submit_async_readv_prealloc(net->tapfd, ctx->effective_iov, ctx->effective_iovcnt, 0, virtio_net_async_rx_done, ctx, &ctx->req_data);
+        if (ret < 0) {
+            log_error("Failed to resubmit stalled read for net: %d", ret);
+            update_used_ring(vq, ctx->idx, 0);
+            virtio_inject_irq(vq);
+        } else {
+            net->pending_rx++;
+        }
+    }
 
     // if vq is not setup, drop the packet
     if (!net->rx_ready) {
@@ -287,6 +305,10 @@ static void virtio_net_event_handler(int fd, void *param) {
             virtio_inject_irq(vq);
             continue;
         }
+
+        // Save for potential retry (EAGAIN/stalled)
+        ctx->effective_iov = iov_packet;
+        ctx->effective_iovcnt = temp_n;
         
         // Async Read
         int ret = submit_async_readv_prealloc(net->tapfd, iov_packet, temp_n, 0, virtio_net_async_rx_done, ctx, &ctx->req_data);
@@ -300,16 +322,16 @@ static void virtio_net_event_handler(int fd, void *param) {
         loop_count++;
     }
 
-    if (loop_count > 0) {
+        if (loop_count > 0) {
         io_flush();
         // Pipeline optimization: if we still have buffers, re-arm poll immediately
         // instead of waiting for all IOs to complete.
-        if (!net->rx_poll_active && !virtqueue_is_empty(vq)) {
+        if (!net->rx_poll_active && (!virtqueue_is_empty(vq) || net->stalled_read_ctx)) {
             add_event_read_prealloc(net->tapfd, virtio_net_event_handler, vdev, &net->poll_req);
             net->rx_poll_active = true;
         }
     } else {
-        if (net->pending_rx == 0) {
+        if (net->pending_rx == 0 && !net->stalled_read_ctx) {
              add_event_read_prealloc(net->tapfd, virtio_net_event_handler, vdev, &net->poll_req);
              net->rx_poll_active = true;
         }

@@ -39,6 +39,8 @@ struct net_rx_ctx {
     uint16_t idx;
     struct iovec iov[NET_IOV_MAX];
     int iovcnt;
+    struct iovec *effective_iov; // Pointer to iov after header removal
+    int effective_iovcnt;        // Count of iov after header removal
     void *vnet_header;
     size_t header_len;
     VirtIODevice *vdev;
@@ -61,6 +63,7 @@ typedef struct virtio_net_dev {
     bool rx_poll_active;
     struct net_rx_ctx *rx_ctxs;
     struct net_tx_ctx *tx_ctxs;
+    struct net_rx_ctx *stalled_read_ctx;
     struct request_data poll_req;
 } NetDev;
 
