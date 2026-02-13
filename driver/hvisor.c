@@ -64,56 +64,6 @@ static int hvisor_finish_req(void) {
     return 0;
 }
 
-// static int flush_cache(__u64 phys_start, __u64 size)
-// {
-//     void __iomem *vaddr;
-//     int err = 0;
-
-//     size = PAGE_ALIGN(size);
-
-//     // 使用 ioremap 映射物理地址
-//     vaddr = ioremap_cache(phys_start, size);
-//     if (!vaddr) {
-//         pr_err("hvisor.ko: failed to ioremap image\n");
-//         return -ENOMEM;
-//     }
-
-//     // flush I-cache（ARM64 平台中 flush_icache_range 是对 D/I 的处理）
-//     flush_icache_range((unsigned long)vaddr, (unsigned long)vaddr + size);
-
-//     // 解除映射
-//     iounmap(vaddr);
-//     return err;
-// }
-// static int flush_cache(__u64 phys_start, __u64 size)
-// {
-//     struct vm_struct *vma;
-//     int err = 0;
-//     size = PAGE_ALIGN(size);
-//     vma = get_vm_area(size, VM_IOREMAP);
-//     if (!vma)
-//     {
-//         pr_err("hvisor.ko: failed to allocate virtual kernel memory for
-//         image\n"); return -ENOMEM;
-//     }
-//     vma->phys_addr = phys_start;
-
-//     if (ioremap_page_range((unsigned long)vma->addr, (unsigned
-//     long)(vma->addr + size), phys_start, PAGE_KERNEL_EXEC))
-//     {
-//         pr_err("hvisor.ko: failed to ioremap image\n");
-//         err = -EFAULT;
-//         goto unmap_vma;
-//     }
-//     // flush icache will also flush dcache
-//     flush_icache_range((unsigned long)(vma->addr), (unsigned long)(vma->addr
-//     + size));
-
-// unmap_vma:
-//     vunmap(vma->addr);
-//     return err;
-// }
-
 static int hvisor_zone_start(zone_config_t __user *arg) {
     int err = 0;
     zone_config_t *zone_config = kmalloc(sizeof(zone_config_t), GFP_KERNEL);
@@ -138,28 +88,6 @@ static int hvisor_zone_start(zone_config_t __user *arg) {
     kfree(zone_config);
     return err;
 }
-
-// #ifndef LOONGARCH64
-// static int is_reserved_memory(unsigned long phys, unsigned long size) {
-//     struct device_node *parent, *child;
-//     struct reserved_mem *rmem;
-//     phys_addr_t mem_base;
-//     size_t mem_size;
-//     int count = 0;
-//     parent = of_find_node_by_path("/reserved-memory");
-//     count = of_get_child_count(parent);
-
-//     for_each_child_of_node(parent, child) {
-//         rmem = of_reserved_mem_lookup(child);
-//         mem_base = rmem->base;
-//         mem_size = rmem->size;
-//         if (mem_base <= phys && (mem_base + mem_size) >= (phys + size)) {
-//             return 1;
-//         }
-//     }
-//     return 0;
-// }
-// #endif
 
 static int hvisor_config_check(u64 __user *arg) {
     int err = 0;
