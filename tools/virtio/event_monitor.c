@@ -29,6 +29,17 @@
 static struct io_uring ring;
 static int signal_fd = -1;
 static int irq_event_fd = -1;
+static int irq_inject_fd = -1;
+static uint64_t irq_notify_val = 1;
+// Pre-allocated request data for injection
+static struct request_data inject_req = { 
+    .type = REQ_TYPE_IO_WRITE, 
+    .fd = -1, 
+    .cb = NULL, 
+    .param = NULL, 
+    .dynamic = false 
+};
+
 extern int ko_fd; // defined in hvisor.c or virtio.c
 extern volatile struct virtio_bridge *virtio_bridge;
 
@@ -155,6 +166,21 @@ int initialize_event_monitor(void) {
     io_uring_prep_poll_add(sqe, irq_event_fd, POLL_IN);
     io_uring_sqe_set_data(sqe, evt_req);
 
+    // Setup irq inject fd
+    irq_inject_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (irq_inject_fd == -1) {
+        log_error("irq_inject_fd failed");
+        return -1;
+    }
+    
+    if (ioctl(ko_fd, HVISOR_SET_IRQFD, irq_inject_fd) < 0) {
+        log_error("ioctl HVISOR_SET_IRQFD failed");
+        // We can fallback to sync ioctl, so maybe not return -1?
+        // But for this task we assume kernel supports it.
+        return -1;
+    }
+    inject_req.fd = irq_inject_fd;
+
     io_uring_submit(&ring);
     return 0;
 }
@@ -212,8 +238,10 @@ void monitor_loop(void) {
                     case REQ_TYPE_IO_READ:
                     case REQ_TYPE_IO_WRITE:
                         {
-                            io_completion_t cb = (io_completion_t)req->cb;
-                            cb(req->param, res);
+                            if (req->cb) {
+                                io_completion_t cb = (io_completion_t)req->cb;
+                                cb(req->param, res);
+                            }
                             if (req->dynamic) free(req); // Free per-IO request data if dynamic
                         }
                         break;
@@ -336,8 +364,29 @@ int submit_async_writev_prealloc(int fd, const struct iovec *iov, int iovcnt, ui
     return 0;
 }
 
+void submit_irq_inject_async(void) {
+    if (irq_inject_fd == -1) {
+        // Fallback to sync ioctl if eventfd is not ready
+        ioctl(ko_fd, HVISOR_FINISH_REQ);
+        return;
+    }
+    
+    struct io_uring_sqe *sqe = get_sqe_safe();
+    if (!sqe) {
+        // Fallback to sync ioctl if SQ is full
+        ioctl(ko_fd, HVISOR_FINISH_REQ);
+        return;
+    }
+    
+    io_uring_prep_write(sqe, irq_inject_fd, &irq_notify_val, sizeof(uint64_t), 0);
+    io_uring_sqe_set_data(sqe, &inject_req);
+    // We don't flush immediately to allow batching. 
+    // The main loop or subsequent IOs will flush.
+}
+
 void destroy_event_monitor(void) {
     if (signal_fd != -1) close(signal_fd);
     if (irq_event_fd != -1) close(irq_event_fd);
+    if (irq_inject_fd != -1) close(irq_inject_fd);
     io_uring_queue_exit(&ring);
 }

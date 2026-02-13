@@ -66,6 +66,9 @@ int submit_async_writev_prealloc(int fd, const struct iovec *iov, int iovcnt, ui
 // Explicitly flush pending requests to io_uring
 void io_flush(void);
 
+// Submit an async irq inject request
+void submit_irq_inject_async(void);
+
 void destroy_event_monitor(void);
 
 #endif // HVISOR_EVENT_H

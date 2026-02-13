@@ -1028,7 +1028,7 @@ void virtio_inject_irq(VirtQueue *vq) {
     // pthread_mutex_unlock(&RES_MUTEX);
     log_debug("inject irq to device %s, vq is %d",
               virtio_device_type_to_string(vq->dev->type), vq->vq_idx);
-    ioctl(ko_fd, HVISOR_FINISH_REQ);
+    submit_irq_inject_async();
 }
 
 void virtio_finish_cfg_req(uint32_t target_cpu, uint64_t value) {

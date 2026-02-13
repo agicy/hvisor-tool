@@ -34,7 +34,25 @@
 struct virtio_bridge *virtio_bridge;
 int virtio_irq = -1;
 static struct task_struct *task = NULL;
-struct eventfd_ctx *virtio_irq_ctx = NULL;
+struct eventfd_ctx *virtio_irq_ctx = NULL; // Notify userspace (Guest -> Host)
+// struct eventfd_ctx *virtio_inject_ctx = NULL; // Removed: using hvisor_irqfd instead
+wait_queue_head_t wq;
+
+#include <linux/poll.h>
+#include <linux/workqueue.h>
+#include <linux/file.h>
+#include <linux/mutex.h>
+
+struct hvisor_irqfd {
+    struct file *file;
+    wait_queue_head_t *wqh;
+    poll_table pt;
+    wait_queue_entry_t wait;
+    struct work_struct inject_work;
+};
+
+static struct hvisor_irqfd *active_irqfd = NULL;
+static DEFINE_MUTEX(irqfd_mutex);
 
 // initial virtio el2 shared region
 static int hvisor_init_virtio(void) {
@@ -49,6 +67,7 @@ static int hvisor_init_virtio(void) {
     SetPageReserved(virt_to_page(virtio_bridge));
     // init device region
     memset(virtio_bridge, 0, sizeof(struct virtio_bridge));
+    init_waitqueue_head(&wq);
     err = hvisor_call(HVISOR_HC_INIT_VIRTIO, __pa(virtio_bridge), 0);
     if (err)
         return err;
@@ -62,6 +81,29 @@ static int hvisor_finish_req(void) {
     if (err)
         return err;
     return 0;
+}
+
+// Workqueue handler
+static void hvisor_inject_work(struct work_struct *work) {
+    hvisor_finish_req();
+}
+
+// Wakeup callback
+static int irqfd_wakeup(wait_queue_entry_t *wait, unsigned mode, int sync, void *key) {
+    struct hvisor_irqfd *irqfd = container_of(wait, struct hvisor_irqfd, wait);
+    unsigned long flags = (unsigned long)key;
+
+    if (flags & POLLIN) {
+        schedule_work(&irqfd->inject_work);
+    }
+    return 0;
+}
+
+// Poll table callback to capture wqh
+static void irqfd_ptable_queue_proc(struct file *file, wait_queue_head_t *wqh, poll_table *pt) {
+    struct hvisor_irqfd *irqfd = container_of(pt, struct hvisor_irqfd, pt);
+    irqfd->wqh = wqh;
+    add_wait_queue(wqh, &irqfd->wait);
 }
 
 static int hvisor_zone_start(zone_config_t __user *arg) {
@@ -170,6 +212,53 @@ static long hvisor_ioctl(struct file *file, unsigned int ioctl,
                 eventfd_ctx_put(virtio_irq_ctx);
             virtio_irq_ctx = ctx;
         }
+        break;
+    }
+    case HVISOR_SET_IRQFD: {
+        int fd = (int)arg;
+        struct file *f;
+        struct hvisor_irqfd *irqfd;
+
+        mutex_lock(&irqfd_mutex);
+
+        // Clean up old irqfd if exists
+        if (active_irqfd) {
+            // Remove from wait queue
+            if (active_irqfd->wqh) {
+                remove_wait_queue(active_irqfd->wqh, &active_irqfd->wait);
+            }
+            // Use cancel_work_sync to ensure no work is running or pending
+            cancel_work_sync(&active_irqfd->inject_work);
+            fput(active_irqfd->file);
+            kfree(active_irqfd);
+            active_irqfd = NULL;
+        }
+
+        f = eventfd_fget(fd);
+        if (IS_ERR(f)) {
+            err = PTR_ERR(f);
+            mutex_unlock(&irqfd_mutex);
+            break;
+        }
+
+        irqfd = kzalloc(sizeof(*irqfd), GFP_KERNEL);
+        if (!irqfd) {
+            fput(f);
+            err = -ENOMEM;
+            mutex_unlock(&irqfd_mutex);
+            break;
+        }
+
+        irqfd->file = f;
+        INIT_WORK(&irqfd->inject_work, hvisor_inject_work);
+        init_waitqueue_func_entry(&irqfd->wait, irqfd_wakeup);
+        init_poll_funcptr(&irqfd->pt, irqfd_ptable_queue_proc);
+
+        // Install wait queue via poll
+        vfs_poll(f, &irqfd->pt);
+
+        active_irqfd = irqfd;
+        mutex_unlock(&irqfd_mutex);
         break;
     }
 #ifdef LOONGARCH64
@@ -323,6 +412,18 @@ static void __exit hvisor_exit(void) {
         free_irq(virtio_irq, &hvisor_misc_dev);
     if (virtio_irq_ctx)
         eventfd_ctx_put(virtio_irq_ctx);
+    
+    // Cleanup active_irqfd
+    if (active_irqfd) {
+        if (active_irqfd->wqh) {
+            remove_wait_queue(active_irqfd->wqh, &active_irqfd->wait);
+        }
+        cancel_work_sync(&active_irqfd->inject_work);
+        fput(active_irqfd->file);
+        kfree(active_irqfd);
+        active_irqfd = NULL;
+    }
+
     if (virtio_bridge != NULL) {
         ClearPageReserved(virt_to_page(virtio_bridge));
         free_pages((unsigned long)virtio_bridge, 0);
