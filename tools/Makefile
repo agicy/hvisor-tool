@@ -1,4 +1,4 @@
-sources ?= $(wildcard *.c) $(wildcard ./virtio/*.c) ../cJSON/cJSON.c
+sources ?= $(wildcard *.c) $(wildcard *.cpp) $(wildcard ./virtio/*.c) $(wildcard ./virtio/*.cpp) ../cJSON/cJSON.c
 
 # Include device-specific Makefiles
 include ./virtio/devices/blk/Makefile
@@ -6,7 +6,10 @@ include ./virtio/devices/console/Makefile
 include ./virtio/devices/net/Makefile
 include ./virtio/devices/gpu/Makefile
 
-objects ?= $(sources:.c=.o)
+c_objects := $(patsubst %.c,%.o,$(filter %.c,$(sources)))
+cpp_objects := $(patsubst %.cpp,%.o,$(filter %.cpp,$(sources)))
+objects := $(c_objects) $(cpp_objects)
+
 ivc_demo_object ?= ivc_demo.o
 rpmsg_demo_object ?= rpmsg_demo.o
 hvisor_objects ?= $(filter-out $(ivc_demo_object) $(rpmsg_demo_object), $(objects))
@@ -52,7 +55,7 @@ ifeq ($(VIRTIO_GPU), y)
 	CFLAGS += -DENABLE_VIRTIO_GPU
 endif
 
-include $(sources:.c=.d)
+# include $(sources:.c=.d)
 
 ifeq ($(DEBUG), y)
 	CFLAGS += -g -O0
@@ -61,6 +64,9 @@ else
 endif
 
 CC := $(CROSS_COMPILE)gcc
+CXX := $(CROSS_COMPILE)g++
+
+CXXFLAGS := $(CFLAGS) -std=c++20 -fcoroutines
 
 ifeq ($(ARCH), arm64)
 	ifeq ($(VIRTIO_GPU), y)
@@ -74,6 +80,11 @@ else ifeq ($(ARCH), loongarch)
 	ifeq ($(VIRTIO_GPU), y)
 		include_dirs += -I/opt/libdrm-install/include -L/opt/libdrm-install/lib -I/opt/libdrm-install/include/libdrm -ldrm
 	endif
+else ifeq ($(ARCH), x86_64)
+	CC := x86_64-linux-gnu-gcc
+	CXX := x86_64-linux-gnu-g++
+	READELF := x86_64-linux-gnu-readelf
+	OBJDUMP := x86_64-linux-gnu-objdump
 endif
 
 .PHONY: all clean
@@ -86,17 +97,20 @@ all: hvisor ivc_demo rpmsg_demo
 	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@; \
 	rm -f $@.$$$$
 
-$(objects): %.o: %.c
-	$(CC) $(CFLAGS) $(include_dirs) $(LIBS) -c -o $@ $<
+%.o: %.c
+	$(CC) $(CFLAGS) $(include_dirs) -c $< -o $@
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(include_dirs) -c $< -o $@
 
 hvisor: $(hvisor_objects)
-	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LDFLAGS) $(LIBS)
+	$(CXX) $(hvisor_objects) $(LDFLAGS) -o hvisor
 
 ivc_demo: $(ivc_demo_object)
-	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LDFLAGS) $(LIBS)
+	$(CC) $(ivc_demo_object) $(LDFLAGS) -o ivc_demo
 
 rpmsg_demo: $(rpmsg_demo_object)
-	$(CC) -o $@ $^ $(CFLAGS) $(include_dirs) $(LDFLAGS) $(LIBS)
+	$(CC) $(rpmsg_demo_object) $(LDFLAGS) -o rpmsg_demo
 
 clean:
-	@rm -f hvisor ivc_demo rpmsg_demo *.o *.d *.d.* virtio/*.o virtio/*.d virtio/*.d.* virtio/devices/*/*.o virtio/devices/*/*.d virtio/devices/*/*.d.* ../cJSON/*.o ../cJSON/*.d ../cJSON/*.d.*
+	rm -f $(objects) $(objects:.o=.d) hvisor ivc_demo rpmsg_demo

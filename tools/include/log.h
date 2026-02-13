@@ -21,6 +21,10 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define LOG_VERSION "0.1.0"
 
 enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL };
@@ -39,4 +43,9 @@ void log_set_quiet(bool enable);
 void log_log(int level, const char *file, int line, const char *fmt, ...);
 void multithread_log_init();
 void multithread_log_exit();
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif

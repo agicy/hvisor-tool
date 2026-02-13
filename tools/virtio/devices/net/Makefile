@@ -1,1 +1,1 @@
-sources += $(wildcard ./virtio/devices/net/*.c)
+sources += $(wildcard ./virtio/devices/net/*.cpp)

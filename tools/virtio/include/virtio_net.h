@@ -12,7 +12,14 @@
 #define _HVISOR_VIRTIO_NET_H
 #include "event_monitor.h"
 #include "virtio.h"
+
+#define class _class_  // 将 class 替换为其他名称（如 _class_）
 #include <linux/virtio_net.h>
+#undef class
+
+#ifdef __cplusplus
+#include "coroutine_utils.hpp"
+#endif
 
 // Queue idx for virtio net.
 #define NET_QUEUE_RX 0
@@ -44,7 +51,9 @@ struct net_rx_ctx {
     void *vnet_header;
     size_t header_len;
     VirtIODevice *vdev;
+#ifndef __cplusplus
     struct request_data req_data;
+#endif
 };
 
 struct net_tx_ctx {
@@ -52,7 +61,9 @@ struct net_tx_ctx {
     uint16_t idx;
     struct iovec iov[NET_IOV_MAX];
     int iovcnt;
+#ifndef __cplusplus
     struct request_data req_data;
+#endif
 };
 
 typedef struct virtio_net_dev {
@@ -65,7 +76,11 @@ typedef struct virtio_net_dev {
     struct net_tx_ctx *tx_ctxs;
     struct net_rx_ctx *stalled_read_ctx;
     struct request_data poll_req;
+#ifndef __cplusplus
 } NetDev;
+#else
+} NetDev;
+#endif
 
 NetDev *virtio_net_alloc_dev(uint8_t mac[]);
 int virtio_net_init(VirtIODevice *vdev, char *devname);

@@ -20,6 +20,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+
 #define VIRT_QUEUE_SIZE 512
 
 typedef struct VirtMmioRegs {
@@ -101,6 +102,11 @@ struct VirtQueue {
                                // the frontend driver of the backend processing
                                // progress Enabling this feature will change the
                                // flags field of the avail_ring
+
+    // If set, this event will be signaled when the queue is notified.
+    // This is used by coroutine-based devices (blk, net, console) to wake up
+    // their worker tasks.
+    void *notification_event;
 };
 
 // The highest abstruct representations of virtio device
@@ -125,7 +131,7 @@ struct VirtIODevice {
     void (*virtio_close)(
         VirtIODevice *vdev); // Function called when closing the virtio device
     int (*queue_resize)(VirtIODevice *vdev, int queue_idx, int new_num);
-    bool activated;          // Whether the current virtio device is activated
+    bool activated; // Whether the current virtio device is activated
 };
 
 // used event idx for driver telling device when to notify driver.
@@ -145,15 +151,65 @@ int set_nonblocking(int fd);
 int get_zone_ram_index(void *zonex_ipa, int zone_id);
 
 /// Check if circular queue is full. size must be a power of 2
-int is_queue_full(unsigned int front, unsigned int rear, unsigned int size);
+inline int is_queue_full(unsigned int front, unsigned int rear,
+                         unsigned int size) {
+    if (((rear + 1) & (size - 1)) == front) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
 
-int is_queue_empty(unsigned int front, unsigned int rear);
+inline int is_queue_empty(unsigned int front, unsigned int rear) {
+    return rear == front;
+}
 
-void write_barrier(void);
+/// Write barrier to make sure all write operations are finished before this
+/// operation
+inline void write_barrier(void) {
+#ifdef ARM64
+    asm volatile("dmb ishst" ::: "memory");
+#endif
+#ifdef RISCV64
+    asm volatile("fence w,w" ::: "memory");
+#endif
+#ifdef LOONGARCH64
+    asm volatile("dbar 0" ::: "memory");
+#endif
+#ifdef X86_64
+    asm volatile("" ::: "memory");
+#endif
+}
 
-void read_barrier(void);
+inline void read_barrier(void) {
+#ifdef ARM64
+    asm volatile("dmb ishld" ::: "memory");
+#endif
+#ifdef RISCV64
+    asm volatile("fence r,r" ::: "memory");
+#endif
+#ifdef LOONGARCH64
+    asm volatile("dbar 0" ::: "memory");
+#endif
+#ifdef X86_64
+    asm volatile("" ::: "memory");
+#endif
+}
 
-void rw_barrier(void);
+inline void rw_barrier(void) {
+#ifdef ARM64
+    asm volatile("dmb ish" ::: "memory");
+#endif
+#ifdef RISCV64
+    asm volatile("fence rw,rw" ::: "memory");
+#endif
+#ifdef LOONGARCH64
+    asm volatile("dbar 0" ::: "memory");
+#endif
+#ifdef X86_64
+    asm volatile("" ::: "memory");
+#endif
+}
 
 VirtIODevice *create_virtio_device(VirtioDeviceType dev_type, uint32_t zone_id,
                                    uint64_t base_addr, uint64_t len,
@@ -222,8 +278,6 @@ int create_virtio_device_from_json(cJSON *device_json, int zone_id);
 
 int virtio_start_from_json(char *json_path);
 
-int virtio_start(int argc, char *argv[]);
-
-void *read_file(char *filename, uint64_t *filesize);
+#include "virtio_api.h"
 
 #endif /* __HVISOR_VIRTIO_H */

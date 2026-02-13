@@ -16,9 +16,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/eventfd.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -30,6 +30,7 @@
 #include "log.h"
 #include "safe_cjson.h"
 #include "virtio.h"
+#include "virtio_api.h"
 #include "virtio_blk.h"
 #include "virtio_console.h"
 #include "virtio_gpu.h"
@@ -98,65 +99,9 @@ int get_zone_ram_index(void *zonex_ipa, int zone_id) {
     return -1;
 }
 
-inline int is_queue_full(unsigned int front, unsigned int rear,
-                         unsigned int size) {
-    if (((rear + 1) & (size - 1)) == front) {
-        return 1;
-    } else {
-        return 0;
-    }
-}
-
-inline int is_queue_empty(unsigned int front, unsigned int rear) {
-    return rear == front;
-}
-
-/// Write barrier to make sure all write operations are finished before this
-/// operation
-inline void write_barrier(void) {
-#ifdef ARM64
-    asm volatile("dmb ishst" ::: "memory");
+#ifdef __cplusplus
+#include "coroutine_utils.hpp"
 #endif
-#ifdef RISCV64
-    asm volatile("fence w,w" ::: "memory");
-#endif
-#ifdef LOONGARCH64
-    asm volatile("dbar 0" ::: "memory");
-#endif
-#ifdef X86_64
-    asm volatile("" ::: "memory");
-#endif
-}
-
-inline void read_barrier(void) {
-#ifdef ARM64
-    asm volatile("dmb ishld" ::: "memory");
-#endif
-#ifdef RISCV64
-    asm volatile("fence r,r" ::: "memory");
-#endif
-#ifdef LOONGARCH64
-    asm volatile("dbar 0" ::: "memory");
-#endif
-#ifdef X86_64
-    asm volatile("" ::: "memory");
-#endif
-}
-
-inline void rw_barrier(void) {
-#ifdef ARM64
-    asm volatile("dmb ish" ::: "memory");
-#endif
-#ifdef RISCV64
-    asm volatile("fence rw,rw" ::: "memory");
-#endif
-#ifdef LOONGARCH64
-    asm volatile("dbar 0" ::: "memory");
-#endif
-#ifdef X86_64
-    asm volatile("" ::: "memory");
-#endif
-}
 
 // create a virtio device.
 VirtIODevice *create_virtio_device(VirtioDeviceType dev_type, uint32_t zone_id,
@@ -169,7 +114,7 @@ VirtIODevice *create_virtio_device(VirtioDeviceType dev_type, uint32_t zone_id,
         irq_id);
     VirtIODevice *vdev = NULL;
     int is_err;
-    vdev = calloc(1, sizeof(VirtIODevice));
+    vdev = (VirtIODevice *)calloc(1, sizeof(VirtIODevice));
     if (vdev == NULL) {
         log_error("failed to allocate virtio device");
         return NULL;
@@ -196,7 +141,7 @@ VirtIODevice *create_virtio_device(VirtioDeviceType dev_type, uint32_t zone_id,
 
     case VirtioTNet:
         vdev->regs.dev_feature = NET_SUPPORTED_FEATURES;
-        vdev->dev = virtio_net_alloc_dev(arg0);
+        vdev->dev = virtio_net_alloc_dev((uint8_t *)arg0);
         init_virtio_queue(vdev, dev_type);
         is_err = virtio_net_init(vdev, (char *)arg1);
         break;
@@ -257,44 +202,53 @@ void init_virtio_queue(VirtIODevice *vdev, VirtioDeviceType type) {
     log_info("Initializing virtio queue for zone:%d, device type:%s",
              vdev->zone_id, virtio_device_type_to_string(type));
 
+    // Helper to initialize common queue fields
+    auto init_vq_common = [&](VirtQueue *vq, int idx, int num_max) {
+        virtqueue_reset(vq, idx);
+        vq->queue_num_max = num_max;
+        vq->dev = vdev;
+#ifdef __cplusplus
+        if (type != VirtioTGPU) {
+            vq->notification_event = new virtio::CoroutineEvent();
+        } else {
+            vq->notification_event = nullptr;
+        }
+#endif
+    };
+
     switch (type) {
     case VirtioTBlock:
         vdev->vqs_len = 1;
-        vqs = malloc(sizeof(VirtQueue));
-        virtqueue_reset(vqs, 0);
-        vqs->queue_num_max = VIRTQUEUE_BLK_MAX_SIZE;
-        vqs->notify_handler = virtio_blk_notify_handler;
-        vqs->dev = vdev;
+        vqs = (VirtQueue *)malloc(sizeof(VirtQueue));
+        init_vq_common(&vqs[0], 0, VIRTQUEUE_BLK_MAX_SIZE);
+        // vqs->notify_handler = virtio_blk_notify_handler; // Removed
         vdev->vqs = vqs;
         vdev->queue_resize = virtio_blk_queue_resize;
         break;
 
     case VirtioTNet:
         vdev->vqs_len = NET_MAX_QUEUES;
-        vqs = malloc(sizeof(VirtQueue) * NET_MAX_QUEUES);
+        vqs = (VirtQueue *)malloc(sizeof(VirtQueue) * NET_MAX_QUEUES);
         for (int i = 0; i < NET_MAX_QUEUES; ++i) {
-            virtqueue_reset(vqs, i);
-            vqs[i].queue_num_max = VIRTQUEUE_NET_MAX_SIZE;
-            vqs[i].dev = vdev;
+            init_vq_common(&vqs[i], i, VIRTQUEUE_NET_MAX_SIZE);
         }
-        vqs[NET_QUEUE_RX].notify_handler = virtio_net_rxq_notify_handler;
-        vqs[NET_QUEUE_TX].notify_handler = virtio_net_txq_notify_handler;
+        // vqs[NET_QUEUE_RX].notify_handler = virtio_net_rxq_notify_handler; //
+        // Removed vqs[NET_QUEUE_TX].notify_handler =
+        // virtio_net_txq_notify_handler; // Removed
         vdev->vqs = vqs;
         vdev->queue_resize = virtio_net_queue_resize;
         break;
 
     case VirtioTConsole:
         vdev->vqs_len = CONSOLE_MAX_QUEUES;
-        vqs = malloc(sizeof(VirtQueue) * CONSOLE_MAX_QUEUES);
+        vqs = (VirtQueue *)malloc(sizeof(VirtQueue) * CONSOLE_MAX_QUEUES);
         for (int i = 0; i < CONSOLE_MAX_QUEUES; ++i) {
-            virtqueue_reset(vqs, i);
-            vqs[i].queue_num_max = VIRTQUEUE_CONSOLE_MAX_SIZE;
-            vqs[i].dev = vdev;
+            init_vq_common(&vqs[i], i, VIRTQUEUE_CONSOLE_MAX_SIZE);
         }
-        vqs[CONSOLE_QUEUE_RX].notify_handler =
-            virtio_console_rxq_notify_handler;
-        vqs[CONSOLE_QUEUE_TX].notify_handler =
-            virtio_console_txq_notify_handler;
+        // vqs[CONSOLE_QUEUE_RX].notify_handler =
+        // virtio_console_rxq_notify_handler; // Removed
+        // vqs[CONSOLE_QUEUE_TX].notify_handler =
+        // virtio_console_txq_notify_handler; // Removed
         vdev->vqs = vqs;
         vdev->queue_resize = virtio_console_queue_resize;
         break;
@@ -302,11 +256,9 @@ void init_virtio_queue(VirtIODevice *vdev, VirtioDeviceType type) {
     case VirtioTGPU:
 #ifdef ENABLE_VIRTIO_GPU
         vdev->vqs_len = GPU_MAX_QUEUES;
-        vqs = malloc(sizeof(VirtQueue) * GPU_MAX_QUEUES);
+        vqs = (VirtQueue *)malloc(sizeof(VirtQueue) * GPU_MAX_QUEUES);
         for (int i = 0; i < GPU_MAX_QUEUES; ++i) {
-            virtqueue_reset(vqs, i);
-            vqs[i].queue_num_max = VIRTQUEUE_GPU_MAX_SIZE;
-            vqs[i].dev = vdev;
+            init_vq_common(&vqs[i], i, VIRTQUEUE_GPU_MAX_SIZE);
         }
         vqs[GPU_CONTROL_QUEUE].notify_handler = virtio_gpu_ctrl_notify_handler;
         vqs[GPU_CURSOR_QUEUE].notify_handler = virtio_gpu_cursor_notify_handler;
@@ -344,14 +296,14 @@ void virtio_dev_reset(VirtIODevice *vdev) {
 
 void virtqueue_reset(VirtQueue *vq, int idx) {
     // Reserve these fields
-    void *addr = vq->notify_handler;
+    void *addr = (void *)vq->notify_handler;
     VirtIODevice *dev = vq->dev;
     uint32_t queue_num_max = vq->queue_num_max;
 
     // Clear others
     memset(vq, 0, sizeof(VirtQueue));
     vq->vq_idx = idx;
-    vq->notify_handler = addr;
+    vq->notify_handler = (int (*)(VirtIODevice *, VirtQueue *))addr;
     vq->dev = dev;
     vq->queue_num_max = queue_num_max;
 }
@@ -493,10 +445,12 @@ int process_descriptor_chain(VirtQueue *vq, uint16_t *desc_idx,
     chain_len += i + 1, next = *desc_idx;
 
     // Allocate a buffer for each descriptor, using iov to manage them uniformly
-    *iov = malloc(sizeof(struct iovec) * (chain_len + append_len));
+    *iov =
+        (struct iovec *)malloc(sizeof(struct iovec) * (chain_len + append_len));
     if (copy_flags)
         // Record the flag of each descriptor
-        *flags = malloc(sizeof(uint16_t) * (chain_len + append_len));
+        *flags =
+            (uint16_t *)malloc(sizeof(uint16_t) * (chain_len + append_len));
 
     // Traverse the descriptor chain and copy the buffer pointed to by each
     // descriptor to iov
@@ -581,7 +535,8 @@ int process_descriptor_chain_into(VirtQueue *vq, uint16_t *desc_idx,
     next = *desc_idx;
 
     if (chain_len + append_len > iov_len) {
-        log_error("iov buffer too small: need %d, have %d", chain_len + append_len, iov_len);
+        log_error("iov buffer too small: need %d, have %d",
+                  chain_len + append_len, iov_len);
         // Rollback last_avail_idx because we failed to process this one?
         // Or just let caller handle it. Usually fatal.
         return -1;
@@ -894,9 +849,19 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
                   virtio_device_type_to_string(vdev->type));
 
         if (value < vdev->vqs_len) {
-            log_trace("queue notify ready, handler addr is %#x",
-                      vqs[value].notify_handler);
-            vqs[value].notify_handler(vdev, &vqs[value]);
+            VirtQueue *vq = &vqs[value];
+#ifdef __cplusplus
+            if (vq->notification_event) {
+                static_cast<virtio::CoroutineEvent *>(vq->notification_event)
+                    ->signal();
+            } else if (vq->notify_handler) {
+                vq->notify_handler(vdev, vq);
+            }
+#else
+            if (vq->notify_handler) {
+                vq->notify_handler(vdev, vq);
+            }
+#endif
         }
 
         log_debug("****** zone %d %s queue notify end ******", vdev->zone_id,
@@ -1015,6 +980,9 @@ void virtio_inject_irq(VirtQueue *vq) {
 
     while (is_queue_full(virtio_bridge->res_front, virtio_bridge->res_rear,
                          MAX_REQ)) {
+        // This is a spin-wait strategy.
+        // TODO: Use a more efficient mechanism to wait for the queue to be
+        //       ready.
     }
     unsigned int res_rear = virtio_bridge->res_rear;
     res = &virtio_bridge->res_list[res_rear];
@@ -1107,6 +1075,45 @@ void initialize_log() {
     log_level = LOG_WARN;
 #endif
     log_set_level(log_level);
+}
+
+static void *read_file(char *filename, uint64_t *filesize) {
+    int fd;
+    struct stat st;
+    void *buf;
+    ssize_t len;
+
+    fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        log_error("read_file: open file %s failed", filename);
+        exit(1);
+    }
+
+    if (fstat(fd, &st) < 0) {
+        log_error("read_file: fstat %s failed", filename);
+        exit(1);
+    }
+
+    long page_size = sysconf(_SC_PAGESIZE);
+
+    // Calculate buffer size, ensuring alignment to page boundary
+    ssize_t buf_size = (st.st_size + page_size - 1) & ~(page_size - 1);
+
+    buf = malloc(buf_size);
+    memset(buf, 0, buf_size);
+
+    len = read(fd, buf, st.st_size);
+    if (len < 0) {
+        perror("read_file: read failed");
+        exit(1);
+    }
+
+    if (filesize)
+        *filesize = len;
+
+    close(fd);
+
+    return buf;
 }
 
 int virtio_init() {
@@ -1258,7 +1265,7 @@ int virtio_start_from_json(char *json_path) {
     int zone_id, num_devices = 0, err = 0, num_zones = 0;
     void *zone0_ipa, *zonex_ipa, *virt_addr;
     unsigned long long mem_size;
-    buffer = read_file(json_path, &file_size);
+    buffer = (char *)read_file(json_path, &file_size);
     buffer[file_size] = '\0';
 
     // Read zones
@@ -1346,7 +1353,7 @@ err_out:
     return err;
 }
 
-int virtio_start(int argc, char *argv[]) {
+extern "C" int virtio_start(int argc, char *argv[]) {
     int opt, err = 0;
     err = virtio_init(); // Initialize virtio dependencies
     if (err)

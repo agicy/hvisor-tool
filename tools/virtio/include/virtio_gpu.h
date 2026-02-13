@@ -23,6 +23,10 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*********************************************************************
     Macro Definitions
  */
@@ -398,6 +402,10 @@ void virtio_gpu_simple_process_cmd(GPUCommand *gcmd, VirtIODevice *vdev);
  */
 // Processing thread
 void *virtio_gpu_handler(void *vdev);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 #endif /* _HVISOR_VIRTIO_GPU_H */

@@ -14,6 +14,10 @@
 #include "virtio.h"
 #include <linux/virtio_console.h>
 
+#ifdef __cplusplus
+#include "coroutine_utils.hpp"
+#endif
+
 #define CONSOLE_SUPPORTED_FEATURES                                             \
     ((1ULL << VIRTIO_F_VERSION_1) | (1ULL << VIRTIO_CONSOLE_F_SIZE))
 #define CONSOLE_MAX_QUEUES 2
@@ -27,7 +31,9 @@ struct console_read_ctx {
     uint16_t idx;
     struct iovec iov[CONSOLE_IOV_MAX];
     int iovcnt;
+#ifndef __cplusplus
     struct request_data req_data;
+#endif
 };
 
 struct console_tx_ctx {
@@ -35,7 +41,9 @@ struct console_tx_ctx {
     uint16_t idx;
     struct iovec iov[CONSOLE_IOV_MAX];
     int iovcnt;
+#ifndef __cplusplus
     struct request_data req_data;
+#endif
 };
 
 typedef struct virtio_console_config ConsoleConfig;

@@ -14,6 +14,10 @@
 #include <liburing.h>
 #include <sys/uio.h>
 
+#ifdef __cplusplus
+#include "io_uring_context.hpp"
+#endif
+
 typedef void (*event_handler_t)(int fd, void *param);
 typedef void (*io_completion_t)(void *param, int res);
 
@@ -70,5 +74,9 @@ void io_flush(void);
 void submit_irq_inject_async(void);
 
 void destroy_event_monitor(void);
+
+#ifdef __cplusplus
+virtio::IoUringContext* get_io_context();
+#endif
 
 #endif // HVISOR_EVENT_H

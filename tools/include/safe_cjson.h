@@ -14,6 +14,10 @@
 
 #include "cJSON.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 cJSON *__safe_cJSON_GetObjectItem(const char *filename, int line,
                                   const cJSON *object, const char *key);
 int __safe_cJSON_GetArraySize(const char *filename, int line,
@@ -32,5 +36,9 @@ void __safe_cJSON_Delete(const char *filename, int line, cJSON *object);
 #define SAFE_CJSON_PARSE(value) __safe_cJSON_Parse(__FILE__, __LINE__, value)
 #define SAFE_CJSON_DELETE(object)                                              \
     __safe_cJSON_Delete(__FILE__, __LINE__, object)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -16,6 +16,10 @@
 #include <stdint.h>
 #include <sys/queue.h>
 
+#ifdef __cplusplus
+#include "coroutine_utils.hpp"
+#endif
+
 /// Maximum number of segments in a request.
 #define BLK_SEG_MAX 512
 #define VIRTQUEUE_BLK_MAX_SIZE 512
@@ -44,7 +48,9 @@ struct blkp_req {
     // Context for async completion
     struct virtio_blk_dev *dev;
     VirtQueue *vq;
+#ifndef __cplusplus
     struct request_data req_data;
+#endif
 };
 
 typedef struct virtio_blk_dev {

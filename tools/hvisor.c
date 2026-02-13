@@ -27,7 +27,7 @@
 #include "hvisor.h"
 #include "log.h"
 #include "safe_cjson.h"
-#include "virtio.h"
+#include "virtio_api.h"
 #include "zone_config.h"
 
 static void __attribute__((noreturn)) help(int exit_status) {
