@@ -583,8 +583,8 @@ void update_used_ring(VirtQueue *vq, uint16_t idx, uint32_t iolen) {
     elem = &used_ring->ring[used_idx++ & mask];
     elem->id = idx;
     elem->len = iolen;
-    used_ring->idx = used_idx;
     write_barrier();
+    used_ring->idx = used_idx;
     // pthread_mutex_unlock(&vq->used_ring_lock);
     log_debug(
         "update used ring: used_idx is %d, elem->idx is %d, vq->num is %d",
