@@ -1368,6 +1368,25 @@ extern "C" int virtio_start(int argc, char *argv[]) {
         virtio_bridge->mmio_addrs[i] = vdevs[i]->base_addr;
     }
 
+    for (int i = 0; i < vdevs_num; i++) {
+        VirtIODevice *vdev = vdevs[i];
+        switch (vdev->type) {
+        case VirtioTBlock:
+            blk_worker_task(vdev);
+            break;
+        case VirtioTConsole:
+            console_rx_task(vdev);
+            console_tx_task(vdev);
+            break;
+        case VirtioTNet:
+            net_rx_task(vdev);
+            net_tx_task(vdev);
+            break;
+        default:
+            break;
+        }
+    }
+
     write_barrier();
     virtio_bridge->mmio_avail = 1;
     write_barrier();

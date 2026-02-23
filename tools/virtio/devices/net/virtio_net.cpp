@@ -298,10 +298,6 @@ int virtio_net_init(VirtIODevice *vdev, char *devname) {
 
     vdev->virtio_close = virtio_net_close;
     
-    // Start tasks
-    net_rx_task(vdev);
-    net_tx_task(vdev);
-    
     return 0;
 }
 

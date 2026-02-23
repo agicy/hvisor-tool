@@ -235,9 +235,6 @@ int virtio_console_init(VirtIODevice *vdev) {
 
     vdev->virtio_close = virtio_console_close;
     
-    console_rx_task(vdev);
-    console_tx_task(vdev);
-
     return 0;
 }
 

@@ -157,7 +157,6 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
 
     vdev->virtio_close = virtio_blk_close;
     
-    blk_worker_task(vdev);
     return 0;
 }
 
