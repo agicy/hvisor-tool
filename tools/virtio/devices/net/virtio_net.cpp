@@ -29,6 +29,7 @@
 static uint8_t trashbuf[1600];
 
 NetDev *virtio_net_alloc_dev(uint8_t mac[]) {
+    log_info("virtio_net_alloc_dev enter");
     NetDev *dev = (NetDev*)malloc(sizeof(NetDev));
     memset(dev, 0, sizeof(NetDev));
     dev->config.mac[0] = mac[0];
@@ -112,6 +113,7 @@ static size_t virtio_net_get_hdr_size(VirtIODevice *vdev) {
 }
 
 virtio::Task net_rx_task(VirtIODevice *vdev) {
+    log_info("net_rx_task enter");
     NetDev *net = (NetDev*)vdev->dev;
     VirtQueue *vq = &vdev->vqs[NET_QUEUE_RX];
     virtio::IoUringContext* io_ctx = get_io_context();
@@ -124,6 +126,7 @@ virtio::Task net_rx_task(VirtIODevice *vdev) {
     awaitables.reserve(MAX_BATCH);
     batch_ctxs.reserve(MAX_BATCH);
 
+    log_info("net_rx_task looping");
     while (true) {
         // 1. Wait for descriptors if empty
         if (virtqueue_is_empty(vq)) {
@@ -211,6 +214,7 @@ virtio::Task net_rx_task(VirtIODevice *vdev) {
 }
 
 virtio::Task net_tx_task(VirtIODevice *vdev) {
+    log_info("net_tx_task enter");
     NetDev *net = (NetDev*)vdev->dev;
     VirtQueue *vq = &vdev->vqs[NET_QUEUE_TX];
     virtio::IoUringContext* io_ctx = get_io_context();
@@ -223,6 +227,7 @@ virtio::Task net_tx_task(VirtIODevice *vdev) {
     awaitables.reserve(MAX_BATCH);
     batch_ctxs.reserve(MAX_BATCH);
 
+    log_info("net_tx_task looping");
     while (true) {
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
@@ -288,6 +293,7 @@ extern "C" int virtio_net_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) 
 */
 
 int virtio_net_init(VirtIODevice *vdev, char *devname) {
+    log_info("virtio_net_init enter");
     NetDev *net = (NetDev*)vdev->dev;
     net->tapfd = virtio_net_open_tap(devname);
     if (net->tapfd < 0) return -1;
@@ -302,6 +308,7 @@ int virtio_net_init(VirtIODevice *vdev, char *devname) {
 }
 
 int virtio_net_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num) {
+    log_info("virtio_net_queue_resize enter");
     NetDev *net = (NetDev*)vdev->dev;
     if (new_num > VIRTQUEUE_NET_MAX_SIZE) {
         struct net_rx_ctx *new_rx = (struct net_rx_ctx*)realloc(net->rx_ctxs, sizeof(struct net_rx_ctx) * new_num);
@@ -313,6 +320,7 @@ int virtio_net_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num) {
 }
 
 void virtio_net_close(VirtIODevice *vdev) {
+    log_info("virtio_net_close enter");
     NetDev *dev = (NetDev*)vdev->dev;
     close(dev->tapfd);
     free(dev->rx_ctxs);
@@ -323,6 +331,7 @@ void virtio_net_close(VirtIODevice *vdev) {
 }
 
 void virtio_net_run(VirtIODevice *vdev) {
+    log_info("virtio_net_run enter");
     net_rx_task(vdev);
     net_tx_task(vdev);
 }

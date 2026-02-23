@@ -48,6 +48,7 @@ void virtio_blk_complete_request(BlkDev *dev, struct blkp_req *req, VirtQueue *v
 }
 
 virtio::Task blk_worker_task(VirtIODevice *vdev) {
+    log_info("blk_worker_task enter");
     BlkDev *dev = (BlkDev*)vdev->dev;
     VirtQueue *vq = &vdev->vqs[0];
     virtio::IoUringContext* io_ctx = get_io_context();
@@ -58,6 +59,7 @@ virtio::Task blk_worker_task(VirtIODevice *vdev) {
     awaitables.reserve(MAX_BATCH);
     batch_reqs.reserve(MAX_BATCH);
 
+    log_info("blk_worker_task looping");
     while (true) {
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
@@ -129,6 +131,7 @@ virtio::Task blk_worker_task(VirtIODevice *vdev) {
 }
 
 BlkDev *virtio_blk_alloc_dev(VirtIODevice *vdev) {
+    log_info("virtio_blk_alloc_dev enter");
     BlkDev *dev = (BlkDev*)malloc(sizeof(BlkDev));
     vdev->dev = dev;
     dev->config.capacity = -1;
@@ -142,6 +145,7 @@ BlkDev *virtio_blk_alloc_dev(VirtIODevice *vdev) {
 }
 
 int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
+    log_info("virtio_blk_init enter");
     BlkDev *dev = (BlkDev*)vdev->dev;
     if (img_path == NULL) return -1;
     
@@ -169,6 +173,7 @@ extern "C" int virtio_blk_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
 */
 
 int virtio_blk_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num) {
+    log_info("virtio_blk_queue_resize enter");
     BlkDev *dev = (BlkDev*)vdev->dev;
     if (new_num > VIRTQUEUE_BLK_MAX_SIZE) {
          struct blkp_req *new_reqs = (struct blkp_req*)realloc(dev->reqs, sizeof(struct blkp_req) * new_num);
@@ -178,6 +183,7 @@ int virtio_blk_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num) {
 }
 
 void virtio_blk_close(VirtIODevice *vdev) {
+    log_info("virtio_blk_close enter");
     BlkDev *dev = (BlkDev *)vdev->dev;
     if (dev->img_fd >= 0) {
         close(dev->img_fd);
@@ -190,5 +196,6 @@ void virtio_blk_close(VirtIODevice *vdev) {
 }
 
 void virtio_blk_run(VirtIODevice *vdev) {
+    log_info("virtio_blk_run enter");
     blk_worker_task(vdev);
 }

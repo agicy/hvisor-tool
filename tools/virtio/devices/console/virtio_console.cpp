@@ -28,6 +28,7 @@
 static uint8_t trashbuf[1024];
 
 ConsoleDev *virtio_console_alloc_dev() {
+    log_info("virtio_console_alloc_dev enter");
     ConsoleDev *dev = (ConsoleDev *)calloc(1, sizeof(ConsoleDev));
     dev->config.cols = 80;
     dev->config.rows = 25;
@@ -55,6 +56,7 @@ extern "C" int virtio_console_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *
 */
 
 virtio::Task console_rx_task(VirtIODevice *vdev) {
+    log_info("console_rx_task enter");
     ConsoleDev *dev = (ConsoleDev*)vdev->dev;
     VirtQueue *vq = &vdev->vqs[CONSOLE_QUEUE_RX];
     virtio::IoUringContext* io_ctx = get_io_context();
@@ -66,6 +68,7 @@ virtio::Task console_rx_task(VirtIODevice *vdev) {
     awaitables.reserve(MAX_BATCH);
     batch_ctxs.reserve(MAX_BATCH);
 
+    log_info("console_rx_task looping");
     while (true) {
         if (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
@@ -136,6 +139,7 @@ virtio::Task console_rx_task(VirtIODevice *vdev) {
 }
 
 virtio::Task console_tx_task(VirtIODevice *vdev) {
+    log_info("console_tx_task enter");
     ConsoleDev *dev = (ConsoleDev*)vdev->dev;
     VirtQueue *vq = &vdev->vqs[CONSOLE_QUEUE_TX];
     virtio::IoUringContext* io_ctx = get_io_context();
@@ -147,6 +151,7 @@ virtio::Task console_tx_task(VirtIODevice *vdev) {
     awaitables.reserve(MAX_BATCH);
     batch_ctxs.reserve(MAX_BATCH);
 
+    log_info("console_tx_task looping");
     while (true) {
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
@@ -209,6 +214,7 @@ extern "C" int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *
 */
 
 int virtio_console_init(VirtIODevice *vdev) {
+    log_info("virtio_console_init enter");
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     dev->master_fd = open("/dev/ptmx", O_RDWR | O_NOCTTY);
     if (dev->master_fd < 0) {
@@ -239,6 +245,7 @@ int virtio_console_init(VirtIODevice *vdev) {
 }
 
 int virtio_console_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num) {
+    log_info("virtio_console_queue_resize enter");
     ConsoleDev *dev = (ConsoleDev*)vdev->dev;
     if (new_num > VIRTQUEUE_CONSOLE_MAX_SIZE) {
         struct console_read_ctx *new_rx = (struct console_read_ctx*)realloc(dev->rx_ctxs, sizeof(struct console_read_ctx) * new_num);
@@ -250,6 +257,7 @@ int virtio_console_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num) 
 }
 
 void virtio_console_close(VirtIODevice *vdev) {
+    log_info("virtio_console_close enter");
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     if (dev->master_fd >= 0) close(dev->master_fd);
     free(dev->rx_ctxs);
@@ -260,6 +268,7 @@ void virtio_console_close(VirtIODevice *vdev) {
 }
 
 void virtio_console_run(VirtIODevice *vdev) {
+    log_info("virtio_console_run enter");
     console_rx_task(vdev);
     console_tx_task(vdev);
 }
