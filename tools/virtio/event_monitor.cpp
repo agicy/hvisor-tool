@@ -41,10 +41,18 @@ virtio::IoUringContext *get_io_context() { return g_io_context; }
 
 // Coroutine to handle signals
 virtio::Task signal_handler_task(int fd) {
+    log_info("signal_handler_task started");
+    
+    struct signalfd_siginfo fdsi;
+
     while (true) {
-        struct signalfd_siginfo fdsi;
+        log_info("signal_handler_task waiting");
+
         auto res =
             co_await g_io_context->async_read(fd, &fdsi, sizeof(fdsi), 0);
+
+        log_info("signal_handler_task signaled");
+
         if (res == sizeof(fdsi)) {
             if (fdsi.ssi_signo == SIGINT || fdsi.ssi_signo == SIGTERM) {
                 log_info("Received signal %d, exiting...", fdsi.ssi_signo);
@@ -57,36 +65,77 @@ virtio::Task signal_handler_task(int fd) {
 
 // Coroutine to handle IRQ injection (persistent)
 virtio::Task irq_inject_worker_task(int fd) {
+    log_info("irq_inject_worker_task started");
+
     uint64_t val = 1;
     while (true) {
+        // TODO
+        log_info("waiting irq_inject_event");
+
         // Wait for signal
         co_await irq_inject_event;
+
+        // TODO
+        log_info("irq_inject_event signaled");
 
         // Perform async write to inject irq
         co_await g_io_context->async_write(fd, &val, sizeof(val), 0);
     }
 }
 
-// Coroutine to handle IRQ event (driver kick)
+// Coroutine to handle IRQ event (driver kick from Hypervisor)
 virtio::Task irq_event_task(int fd) {
+    log_info("irq_event_task started");
+
     uint64_t val;
     while (true) {
-        auto res = co_await g_io_context->async_read(fd, &val, sizeof(val), 0);
-        if (res == sizeof(val)) {
-            // Process requests from shared memory
-            if (virtio_bridge) {
-                unsigned int head = virtio_bridge->req_front;
-                unsigned int tail = virtio_bridge->req_rear;
-                read_barrier();
-                while (!is_queue_empty(head, tail)) {
-                    volatile struct device_req *req =
-                        &virtio_bridge->req_list[head];
-                    virtio_handle_req(req);
-                    head = (head + 1) & (MAX_REQ - 1);
-                }
-                write_barrier();
-                virtio_bridge->req_front = head;
+        // 1. 准备进入等待状态：设置 need_wakeup = 1
+        virtio_bridge->need_wakeup = 1;
+        write_barrier(); // 确保内核能立即看到该标志
+
+        // 2. 在真正挂起前，最后检查一次队列，防止“丢失唤醒” (Lost Wakeup)
+        // 也就是防止内核在设置 need_wakeup 之前塞入请求且没发信号
+        unsigned int head = virtio_bridge->req_front;
+        unsigned int tail = virtio_bridge->req_rear;
+        read_barrier();
+
+        if (is_queue_empty(head, tail)) {
+            log_trace("waiting irq_event_task (queue empty)");
+            // 真正挂起协程，等待内核通过 eventfd/signalfd 唤醒
+            auto res = co_await g_io_context->async_read(fd, &val, sizeof(val), 0);
+            if (res < 0) {
+                log_error("irq_event_task read error: %s", strerror(errno));
+                continue;
             }
+            log_trace("irq_event_task signaled (notified by kernel)");
+        } else {
+            log_trace("irq_event_task: data arrived before sleep, skip waiting");
+        }
+
+        // 3. 已经被唤醒或发现有数据：设置 need_wakeup = 0
+        // 告诉内核：我现在正在忙碌处理，你往队列里放数据即可，不用再发信号
+        virtio_bridge->need_wakeup = 0;
+        write_barrier();
+
+        // 4. 批量处理队列中的所有请求
+        head = virtio_bridge->req_front;
+        tail = virtio_bridge->req_rear;
+        read_barrier();
+
+        while (!is_queue_empty(head, tail)) {
+            volatile struct device_req *req = &virtio_bridge->req_list[head];
+            
+            // 处理具体的 MMIO 读写请求
+            virtio_handle_req(req);
+
+            // 移动指针并写屏障，让内核知道我们处理到哪了
+            head = (head + 1) & (MAX_REQ - 1);
+            virtio_bridge->req_front = head;
+            write_barrier();
+
+            // 重新获取 tail。因为在处理期间，内核可能又塞入了新请求
+            tail = virtio_bridge->req_rear;
+            read_barrier();
         }
     }
 }
