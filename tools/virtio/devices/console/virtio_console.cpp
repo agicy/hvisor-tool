@@ -258,3 +258,8 @@ void virtio_console_close(VirtIODevice *vdev) {
     free(vdev->vqs);
     free(vdev);
 }
+
+void virtio_console_run(VirtIODevice *vdev) {
+    console_rx_task(vdev);
+    console_tx_task(vdev);
+}

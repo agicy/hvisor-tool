@@ -178,10 +178,17 @@ int virtio_blk_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num) {
 }
 
 void virtio_blk_close(VirtIODevice *vdev) {
-    BlkDev *dev = (BlkDev*)vdev->dev;
-    if (dev->img_fd >= 0) close(dev->img_fd);
+    BlkDev *dev = (BlkDev *)vdev->dev;
+    if (dev->img_fd >= 0) {
+        close(dev->img_fd);
+        dev->img_fd = -1;
+    }
     free(dev->reqs);
     free(dev);
     free(vdev->vqs);
     free(vdev);
+}
+
+void virtio_blk_run(VirtIODevice *vdev) {
+    blk_worker_task(vdev);
 }

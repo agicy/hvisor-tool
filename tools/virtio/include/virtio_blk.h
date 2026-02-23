@@ -65,5 +65,6 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path);
 int virtio_blk_notify_handler(VirtIODevice *vdev, VirtQueue *vq);
 int virtio_blk_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num);
 void virtio_blk_close(VirtIODevice *vdev);
+void virtio_blk_run(VirtIODevice *vdev);
 
 #endif /* _HVISOR_VIRTIO_BLK_H */

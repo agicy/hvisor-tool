@@ -321,3 +321,8 @@ void virtio_net_close(VirtIODevice *vdev) {
     free(vdev->vqs);
     free(vdev);
 }
+
+void virtio_net_run(VirtIODevice *vdev) {
+    net_rx_task(vdev);
+    net_tx_task(vdev);
+}

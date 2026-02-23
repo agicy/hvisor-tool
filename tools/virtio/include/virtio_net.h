@@ -88,5 +88,6 @@ int virtio_net_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq);
 int virtio_net_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq);
 int virtio_net_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num);
 void virtio_net_close(VirtIODevice *vdev);
+void virtio_net_run(VirtIODevice *vdev);
 
 #endif //_HVISOR_VIRTIO_NET_H

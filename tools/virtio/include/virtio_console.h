@@ -65,5 +65,6 @@ int virtio_console_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq);
 int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq);
 int virtio_console_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num);
 void virtio_console_close(VirtIODevice *vdev);
+void virtio_console_run(VirtIODevice *vdev);
 
 #endif

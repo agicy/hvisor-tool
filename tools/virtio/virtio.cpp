@@ -1372,15 +1372,13 @@ extern "C" int virtio_start(int argc, char *argv[]) {
         VirtIODevice *vdev = vdevs[i];
         switch (vdev->type) {
         case VirtioTBlock:
-            blk_worker_task(vdev);
+            virtio_blk_run(vdev);
             break;
         case VirtioTConsole:
-            console_rx_task(vdev);
-            console_tx_task(vdev);
+            virtio_console_run(vdev);
             break;
         case VirtioTNet:
-            net_rx_task(vdev);
-            net_tx_task(vdev);
+            virtio_net_run(vdev);
             break;
         default:
             break;
