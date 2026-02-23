@@ -61,6 +61,18 @@ virtio::Task blk_worker_task(VirtIODevice *vdev) {
 
     log_info("blk_worker_task looping");
     while (true) {
+        // 阶段 1：等待设备进入 Ready 状态 (处理初始化和重置)
+        // 使用 while 而非 if，可以防止伪唤醒
+        while (!vq->ready || !vq->avail_ring) {
+            if (vq->notification_event) {
+                co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            } else {
+                // 如果没有事件，通常意味着严重错误或处于同步模式
+                break; 
+            }
+        }
+
+        // 阶段 2：等待队列中有数据 (处理正常的 IO 请求)
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
             if (virtqueue_is_empty(vq)) {
@@ -68,7 +80,16 @@ virtio::Task blk_worker_task(VirtIODevice *vdev) {
                     co_await *(virtio::CoroutineEvent*)vq->notification_event;
             }
             virtqueue_disable_notify(vq);
+            
+            // 唤醒后，如果发现是因为 Reset 导致 ready 没了，
+            // 则 continue 回到阶段 1 重新等待
+            if (!vq->ready) break;
+            
+            // 如果依然为空（伪唤醒），也继续循环
+            if (virtqueue_is_empty(vq)) continue;
         }
+
+        if (!vq->ready) continue; // 醒来后如果 ready 没了，回到最上面等待
 
         virtio::IoUringContext::BatchAwaitable batch;
         batch.ctx = io_ctx;

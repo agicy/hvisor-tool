@@ -128,14 +128,22 @@ virtio::Task net_rx_task(VirtIODevice *vdev) {
 
     log_info("net_rx_task looping");
     while (true) {
+        while (!vq->ready || !vq->avail_ring) {
+            if (vq->notification_event)
+                co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            else
+                break;
+        }
+
         // 1. Wait for descriptors if empty
         if (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
-            if (virtqueue_is_empty(vq)) { // check again to avoid race
+            if (virtqueue_is_empty(vq)) {
                 if (vq->notification_event)
                     co_await *(virtio::CoroutineEvent*)vq->notification_event;
             }
             virtqueue_disable_notify(vq);
+            if (!vq->ready) continue;
         }
 
         if (!net->rx_ready) {
@@ -229,6 +237,13 @@ virtio::Task net_tx_task(VirtIODevice *vdev) {
 
     log_info("net_tx_task looping");
     while (true) {
+        while (!vq->ready || !vq->avail_ring) {
+            if (vq->notification_event)
+                co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            else
+                break;
+        }
+
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
             if (virtqueue_is_empty(vq)) {
@@ -236,7 +251,10 @@ virtio::Task net_tx_task(VirtIODevice *vdev) {
                      co_await *(virtio::CoroutineEvent*)vq->notification_event;
             }
             virtqueue_disable_notify(vq);
+            if (!vq->ready) break; // 退出内部 while 触发外层 ready 检查
         }
+        
+        if (!vq->ready) continue;
 
         virtio::IoUringContext::BatchAwaitable batch;
         batch.ctx = io_ctx;

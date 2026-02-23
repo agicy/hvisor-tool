@@ -17,6 +17,7 @@
 #include "io_uring_context.hpp"
 #include <errno.h>
 #include <fcntl.h>
+#include <cstring>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,12 @@
 #include <termios.h>
 #include <new>
 #include <vector>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <termios.h>
+#include <limits.h> // for PATH_MAX
+#include <errno.h>
 
 static uint8_t trashbuf[1024];
 
@@ -70,14 +77,26 @@ virtio::Task console_rx_task(VirtIODevice *vdev) {
 
     log_info("console_rx_task looping");
     while (true) {
-        if (virtqueue_is_empty(vq)) {
+        while (!vq->ready || !vq->avail_ring) {
+            if (vq->notification_event)
+                co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            else
+                break; // 理论上不会走到这里
+        }
+
+        while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
             if (virtqueue_is_empty(vq)) {
                 if (vq->notification_event)
                     co_await *(virtio::CoroutineEvent*)vq->notification_event;
             }
             virtqueue_disable_notify(vq);
+            if (!vq->ready)
+                break; // 退出内部 while 触发外层 ready 检查
         }
+
+        if (!vq->ready)
+            continue; // 醒来后如果 ready 没了，回到最上面等待
 
         if (dev->rx_ready <= 0) {
              co_await io_ctx->async_read(dev->master_fd, trashbuf, sizeof(trashbuf), 0);
@@ -153,6 +172,13 @@ virtio::Task console_tx_task(VirtIODevice *vdev) {
 
     log_info("console_tx_task looping");
     while (true) {
+        while (!vq->ready || !vq->avail_ring) {
+            if (vq->notification_event)
+                co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            else
+                break;
+        }
+
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
             if (virtqueue_is_empty(vq)) {
@@ -160,7 +186,11 @@ virtio::Task console_tx_task(VirtIODevice *vdev) {
                      co_await *(virtio::CoroutineEvent*)vq->notification_event;
             }
             virtqueue_disable_notify(vq);
+            if (!vq->ready)
+                break; // 退出内部 while 触发外层 ready 检查
         }
+        
+        if (!vq->ready) continue; // 醒来后如果 ready 没了，回到最上面等待
 
         virtio::IoUringContext::BatchAwaitable batch;
         batch.ctx = io_ctx;
@@ -216,29 +246,88 @@ extern "C" int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *
 int virtio_console_init(VirtIODevice *vdev) {
     log_info("virtio_console_init enter");
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
-    dev->master_fd = open("/dev/ptmx", O_RDWR | O_NOCTTY);
-    if (dev->master_fd < 0) {
-        log_error("open ptmx failed");
+    
+    // 1. 打开 PTY 主设备 (Master)
+    // O_NOCTTY: 防止该设备成为当前进程的控制终端
+    // O_RDWR: 读写模式
+    int master_fd = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master_fd < 0) {
+        log_error("posix_openpt failed: %s", strerror(errno));
+        return -1;
+    }
+
+    // 2. 授权 (Grant) 和 解锁 (Unlock)
+    // grantpt: 修改从设备的权限
+    // unlockpt: 允许打开从设备
+    if (grantpt(master_fd) < 0) {
+        log_error("grantpt failed: %s", strerror(errno));
+        close(master_fd);
         return -1;
     }
     
-    grantpt(dev->master_fd);
-    unlockpt(dev->master_fd);
-    log_warn("virtio-console pty path: %s", ptsname(dev->master_fd));
+    if (unlockpt(master_fd) < 0) {
+        log_error("unlockpt failed: %s", strerror(errno));
+        close(master_fd);
+        return -1;
+    }
 
-    if (set_nonblocking(dev->master_fd) < 0) {
-        log_error("set_nonblocking failed");
-        close(dev->master_fd);
+    // 3. 获取从设备名称 (Slave Name) - 使用线程安全的 ptsname_r
+    char slave_path[PATH_MAX];
+    if (ptsname_r(master_fd, slave_path, sizeof(slave_path)) != 0) {
+        log_error("ptsname_r failed: %s", strerror(errno));
+        close(master_fd);
+        return -1;
+    }
+    
+    log_warn("virtio-console pty path: %s", slave_path);
+
+    // 4. 【关键步骤】配置从设备 (Slave)
+    // 必须打开 Slave 才能设置 Termios 属性 (cfmakeraw)
+    // 如果不这样做，PTY 默认处于 "Canonical Mode"（行缓冲+回显），会导致 Console 卡住或显示异常
+    int slave_fd = open(slave_path, O_RDWR | O_NOCTTY);
+    if (slave_fd < 0) {
+        log_error("failed to open slave pty '%s' for config: %s", slave_path, strerror(errno));
+        close(master_fd);
         return -1;
     }
 
     struct termios tio;
-    tcgetattr(dev->master_fd, &tio);
-    cfmakeraw(&tio);
-    tio.c_cc[VMIN] = 1;
-    tio.c_cc[VTIME] = 0;
-    tcsetattr(dev->master_fd, TCSANOW, &tio);
+    if (tcgetattr(slave_fd, &tio) < 0) {
+        log_error("tcgetattr on slave failed");
+        close(slave_fd);
+        close(master_fd);
+        return -1;
+    }
 
+    // 设置 Raw 模式：
+    // - 禁用输入/输出处理 (如回车转换行)
+    // - 禁用回显 (ECHO)
+    // - 禁用信号字符 (如 Ctrl+C 发送 SIGINT)
+    cfmakeraw(&tio);
+    
+    // 应用设置
+    if (tcsetattr(slave_fd, TCSANOW, &tio) < 0) {
+        log_error("tcsetattr on slave failed");
+        close(slave_fd);
+        close(master_fd);
+        return -1;
+    }
+
+    // 配置完成后关闭 Slave FD
+    // 只要 Master FD 保持打开，PTY 会话就会一直存在
+    // 外部工具 (如 screen/minicom) 稍后会再次打开这个 slave_path
+    close(slave_fd);
+
+    // 5. 设置 Master FD 为非阻塞
+    // 这是为了配合 io_uring 或 epoll 使用
+    if (set_nonblocking(master_fd) < 0) {
+        log_error("failed to set master_fd non-blocking");
+        close(master_fd);
+        return -1;
+    }
+
+    // 6. 保存到设备结构体
+    dev->master_fd = master_fd;
     vdev->virtio_close = virtio_console_close;
     
     return 0;
