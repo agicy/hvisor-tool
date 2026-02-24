@@ -584,6 +584,8 @@ int virtqueue_peek(VirtQueue *vq, uint16_t *desc_idx, struct iovec *iov,
     // No new requests
     if (last_avail_idx == vq->avail_ring->idx) return 0;
 
+    read_barrier();
+
     // Get the index of the first available descriptor
     *desc_idx = next = vq->avail_ring->ring[last_avail_idx & (vq->num - 1)];
     // Record the length of the descriptor chain to chain_len
@@ -644,7 +646,6 @@ void update_used_ring(VirtQueue *vq, uint16_t idx, uint32_t iolen) {
     uint16_t used_idx, mask;
     // There is no need to worry about if used_ring is full, because used_ring's
     // len is equal to descriptor table's.
-    write_barrier();
     // pthread_mutex_lock(&vq->used_ring_lock);
     used_ring = vq->used_ring;
     used_idx = used_ring->idx;
