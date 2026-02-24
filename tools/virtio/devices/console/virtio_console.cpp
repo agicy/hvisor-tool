@@ -78,8 +78,11 @@ virtio::Task console_rx_task(VirtIODevice *vdev) {
     log_info("console_rx_task looping");
     while (true) {
         while (!vq->ready || !vq->avail_ring) {
-            if (vq->notification_event)
+            if (vq->notification_event) {
+                log_info("console_rx_task waiting ready");
                 co_await *(virtio::CoroutineEvent*)vq->notification_event;
+                log_info("console_rx_task signaled by ready");
+            }
             else
                 break; // 理论上不会走到这里
         }
@@ -87,8 +90,11 @@ virtio::Task console_rx_task(VirtIODevice *vdev) {
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
             if (virtqueue_is_empty(vq)) {
-                if (vq->notification_event)
+                if (vq->notification_event){
+                    log_info("console_rx_task waiting virtqueue_notify");
                     co_await *(virtio::CoroutineEvent*)vq->notification_event;
+                    log_info("console_rx_task signaled by virtqueue_notify");
+                }
             }
             virtqueue_disable_notify(vq);
             if (!vq->ready)
@@ -98,12 +104,16 @@ virtio::Task console_rx_task(VirtIODevice *vdev) {
         if (!vq->ready)
             continue; // 醒来后如果 ready 没了，回到最上面等待
 
+        dev->rx_ready = 1;
+
         if (dev->rx_ready <= 0) {
              co_await io_ctx->async_read(dev->master_fd, trashbuf, sizeof(trashbuf), 0);
              continue;
         }
 
+        log_info("console_rx_task waiting poll");
         co_await io_ctx->async_poll(dev->master_fd);
+        log_info("console_rx_task signaled by poll");
 
         virtio::IoUringContext::BatchAwaitable batch;
         batch.ctx = io_ctx;
@@ -334,7 +344,8 @@ int virtio_console_init(VirtIODevice *vdev) {
 }
 
 int virtio_console_queue_resize(VirtIODevice *vdev, int queue_idx, int new_num) {
-    log_info("virtio_console_queue_resize enter");
+    log_info("virtio_console_queue_resize called: vdev=%p, queue_idx=%d, new_num=%d",
+             vdev, queue_idx, new_num);
     ConsoleDev *dev = (ConsoleDev*)vdev->dev;
     if (new_num > VIRTQUEUE_CONSOLE_MAX_SIZE) {
         struct console_read_ctx *new_rx = (struct console_read_ctx*)realloc(dev->rx_ctxs, sizeof(struct console_read_ctx) * new_num);

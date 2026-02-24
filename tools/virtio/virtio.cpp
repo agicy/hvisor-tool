@@ -297,6 +297,7 @@ void virtio_dev_reset(VirtIODevice *vdev) {
 void virtqueue_reset(VirtQueue *vq, int idx) {
     // Reserve these fields
     void *addr = (void *)vq->notify_handler;
+    void *event = vq->notification_event;
     VirtIODevice *dev = vq->dev;
     uint32_t queue_num_max = vq->queue_num_max;
 
@@ -304,6 +305,7 @@ void virtqueue_reset(VirtQueue *vq, int idx) {
     memset(vq, 0, sizeof(VirtQueue));
     vq->vq_idx = idx;
     vq->notify_handler = (int (*)(VirtIODevice *, VirtQueue *))addr;
+    vq->notification_event = event;
     vq->dev = dev;
     vq->queue_num_max = queue_num_max;
 }
@@ -654,8 +656,7 @@ static const char *virtio_mmio_reg_name(uint64_t offset) {
 }
 
 uint64_t virtio_mmio_read(VirtIODevice *vdev, uint64_t offset, unsigned size) {
-    log_debug("virtio mmio read at %#x", offset);
-    log_info("READ virtio mmio at offset=%#x[%s], size=%d, vdev=%p, type=%d",
+    log_debug("READ virtio mmio at offset=%#x[%s], size=%d, vdev=%p, type=%d",
              offset, virtio_mmio_reg_name(offset), size, vdev, vdev->type);
 
     if (!vdev) {
@@ -757,9 +758,7 @@ uint64_t virtio_mmio_read(VirtIODevice *vdev, uint64_t offset, unsigned size) {
 
 void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
                        unsigned size) {
-    log_debug("virtio mmio write at %#x, value is %#x", offset, value);
-
-    log_info("WRITE virtio mmio at offset=%#x[%s], value=%#x, size=%d, "
+    log_debug("WRITE virtio mmio at offset=%#x[%s], value=%#x, size=%d, "
              "vdev=%p, type=%d",
              offset, virtio_mmio_reg_name(offset), value, size, vdev,
              vdev->type);
@@ -845,23 +844,19 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
         vqs[regs->queue_sel].ready = value;
         break;
     case VIRTIO_MMIO_QUEUE_NOTIFY:
-        log_debug("****** zone %d %s queue notify begin ******", vdev->zone_id,
+        log_info("****** zone %d %s queue notify begin ******", vdev->zone_id,
                   virtio_device_type_to_string(vdev->type));
 
         if (value < vdev->vqs_len) {
             VirtQueue *vq = &vqs[value];
-#ifdef __cplusplus
+            log_info("notification_event=%p, notify_handler=%p",
+                     vq->notification_event, vq->notify_handler);
             if (vq->notification_event) {
                 static_cast<virtio::CoroutineEvent *>(vq->notification_event)
                     ->signal();
             } else if (vq->notify_handler) {
                 vq->notify_handler(vdev, vq);
             }
-#else
-            if (vq->notify_handler) {
-                vq->notify_handler(vdev, vq);
-            }
-#endif
         }
 
         log_debug("****** zone %d %s queue notify end ******", vdev->zone_id,
@@ -1027,6 +1022,8 @@ int virtio_handle_req(volatile struct device_req *req) {
     }
 
     VirtIODevice *vdev = vdevs[i];
+    log_info("virtio mmio at vdev=%p, type=%d(%s)",
+            vdev, vdev->type, virtio_device_type_to_string(vdev->type));
 
     uint64_t offs = req->address - vdev->base_addr;
 

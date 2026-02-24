@@ -170,10 +170,9 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
     BlkDev *dev = (BlkDev*)vdev->dev;
     if (img_path == NULL) return -1;
     
-    dev->img_fd = open(img_path, O_RDWR | O_DIRECT);
+    dev->img_fd = open(img_path, O_RDWR);
     if (dev->img_fd < 0) {
-        dev->img_fd = open(img_path, O_RDWR);
-        if (dev->img_fd < 0) return -1;
+        return -1;
     }
     
     struct stat st;
