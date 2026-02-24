@@ -111,18 +111,25 @@ virtio::Task console_rx_task(VirtIODevice *vdev) {
              continue;
         }
 
-        log_info("console_rx_task waiting poll");
+        log_info("console_rx_task waiting poll on master_fd: %d", dev->master_fd); // level: debug
         co_await io_ctx->async_poll(dev->master_fd);
-        log_info("console_rx_task signaled by poll");
+        log_info("console_rx_task signaled by poll on master_fd: %d", dev->master_fd); // level: debug
 
         int processed_count = 0;
+        log_info("console_rx_task starting descriptor processing, virtqueue empty: %d", virtqueue_is_empty(vq)); // level: debug
+        
         // Process available descriptors one by one
         while (!virtqueue_is_empty(vq)) {
             uint16_t head_idx;
             struct console_read_ctx *ctx = &dev->rx_ctxs[vq->last_avail_idx & (vq->num - 1)];
 
+            log_info("console_rx_task processing descriptor at index: %d", vq->last_avail_idx); // level: debug
+
             int n = virtqueue_peek(vq, &head_idx, ctx->iov, CONSOLE_IOV_MAX, NULL, 0, false);
+            log_info("console_rx_task virtqueue_peek returned: %d descriptors, head_idx: %d", n, head_idx); // level: debug
+            
             if (n < 1) {
+                log_warn("console_rx_task virtqueue_peek returned %d, breaking descriptor processing loop", n); // level: debug
                 break; // Should not happen if not empty, but as a safeguard
             }
 
@@ -130,26 +137,38 @@ virtio::Task console_rx_task(VirtIODevice *vdev) {
             ctx->idx = head_idx;
             ctx->iovcnt = n;
 
+            log_info("console_rx_task starting async_readv on master_fd: %d with %d iovecs", dev->master_fd, n); // level: debug
+            
             // Perform a single asynchronous read
             auto awaitable = io_ctx->async_readv(dev->master_fd, ctx->iov, n, 0);
             co_await awaitable;
             int res = awaitable.result;
 
+            log_info("console_rx_task async_readv completed with result: %d", res); // level: debug
+
             if (res > 0) {
                 // I/O was successful, now we can pop the descriptor
+                log_info("console_rx_task successful read of %d bytes, popping descriptor", res); // level: debug
                 virtqueue_pop(vq);
                 update_used_ring(vq, ctx->idx, res);
                 processed_count++;
+                log_info("console_rx_task descriptor processed successfully, total processed: %d", processed_count); // level: debug
             } else {
                 // I/O failed or would block (EAGAIN). Do not pop the descriptor.
                 // It will be retried on the next poll notification.
                 log_warn("Console read failed or got EAGAIN, result: %d. Descriptor will be retried.", res);
+                log_info("console_rx_task breaking descriptor processing loop due to read failure", res); // level: debug
                 break; // Stop processing more descriptors for now
             }
         }
 
+        log_info("console_rx_task descriptor processing completed, total descriptors processed: %d", processed_count); // level: debug
+        
         if (processed_count > 0) {
+            log_info("console_rx_task injecting IRQ for %d processed descriptors", processed_count); // level: debug
             virtio_inject_irq(vq);
+        } else {
+            log_info("console_rx_task no descriptors processed, skipping IRQ injection"); // level: debug
         }
     }
 }
