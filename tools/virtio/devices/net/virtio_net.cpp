@@ -156,67 +156,52 @@ virtio::Task net_rx_task(VirtIODevice *vdev) {
         co_await io_ctx->async_poll(net->tapfd);
 
         // 3. Process packets
-        virtio::IoUringContext::BatchAwaitable batch;
-        batch.ctx = io_ctx;
-        
-        awaitables.clear();
-        batch_ctxs.clear();
-        
-        int loop_count = 0;
-        while (loop_count < MAX_BATCH) {
-            if (virtqueue_is_empty(vq)) break;
-            
-            uint16_t last_avail_idx = vq->last_avail_idx;
-            uint16_t head_idx = vq->avail_ring->ring[last_avail_idx & (vq->num - 1)];
-            struct net_rx_ctx *ctx = &net->rx_ctxs[head_idx];
-            
+        int processed_count = 0;
+        while (!virtqueue_is_empty(vq)) {
+            uint16_t head_idx;
+            struct net_rx_ctx *ctx = &net->rx_ctxs[vq->last_avail_idx & (vq->num - 1)];
+
+            int n = virtqueue_peek(vq, &head_idx, ctx->iov, NET_IOV_MAX, NULL, 0, false);
+            if (n < 1) {
+                break; // Should not happen
+            }
+
             ctx->vq = vq;
             ctx->vdev = vdev;
-            
-            int n = process_descriptor_chain_into(vq, &ctx->idx, ctx->iov, NET_IOV_MAX, NULL, 0, false);
-            if (n < 1) {
-                 break;
-            }
+            ctx->idx = head_idx;
             ctx->iovcnt = n;
             ctx->vnet_header = ctx->iov[0].iov_base;
-            
+
             struct iovec *iov_packet = virtio_net_remove_iov_header(ctx->iov, &n, header_len);
-            
-            if (iov_packet) {
-                awaitables.emplace_back();
-                virtio::IoUringContext::IoAwaitable& op = awaitables.back();
-                io_ctx->prep_readv(op, net->tapfd, iov_packet, n, 0);
-                batch_ctxs.push_back(ctx);
-            } else {
-                 update_used_ring(vq, ctx->idx, 0);
-                 virtio_inject_irq(vq);
+            if (!iov_packet) {
+                // Invalid header, pop and complete with 0
+                virtqueue_pop(vq);
+                update_used_ring(vq, ctx->idx, 0);
+                processed_count++;
+                continue;
             }
-            loop_count++;
-        }
-        
-        if (!awaitables.empty()) {
-            for (size_t i = 0; i < awaitables.size(); i++) {
-                batch.ops.push_back(&awaitables[i]);
-            }
-            
-            co_await batch;
-            
-            for (size_t i = 0; i < awaitables.size(); i++) {
-                int res = awaitables[i].result;
-                struct net_rx_ctx *ctx = batch_ctxs[i];
-                
-                if (res > 0) {
-                    memset(ctx->vnet_header, 0, header_len);
-                    if (vdev->regs.drv_feature & (1ULL << VIRTIO_F_VERSION_1)) {
-                        ((NetHdr *)ctx->vnet_header)->num_buffers = 1;
-                    }
-                    update_used_ring(vq, ctx->idx, res + header_len);
-                    virtio_inject_irq(vq);
-                } else {
-                    update_used_ring(vq, ctx->idx, 0);
-                    virtio_inject_irq(vq);
+
+            auto awaitable = io_ctx->async_readv(net->tapfd, iov_packet, n, 0);
+            co_await awaitable;
+            int res = awaitable.result;
+
+            if (res > 0) {
+                virtqueue_pop(vq);
+                memset(ctx->vnet_header, 0, header_len);
+                if (vdev->regs.drv_feature & (1ULL << VIRTIO_F_VERSION_1)) {
+                    ((NetHdr *)ctx->vnet_header)->num_buffers = 1;
                 }
+                update_used_ring(vq, ctx->idx, res + header_len);
+                processed_count++;
+            } else {
+                // EAGAIN or error, don't pop, break loop to re-poll
+                log_warn("Net read failed or got EAGAIN, result: %d. Descriptor will be retried.", res);
+                break;
             }
+        }
+
+        if (processed_count > 0) {
+            virtio_inject_irq(vq);
         }
     }
 }

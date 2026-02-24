@@ -251,6 +251,11 @@ int process_descriptor_chain_into(VirtQueue *vq, uint16_t *desc_idx,
                                   uint16_t *flags, int append_len,
                                   bool copy_flags);
 
+int virtqueue_peek(VirtQueue *vq, uint16_t *desc_idx, struct iovec *iov,
+                   int iov_len, uint16_t *flags, int append_len,
+                   bool copy_flags);
+void virtqueue_pop(VirtQueue *vq);
+
 void update_used_ring(VirtQueue *vq, uint16_t idx, uint32_t iolen);
 
 uint64_t virtio_mmio_read(VirtIODevice *vdev, uint64_t offset, unsigned size);

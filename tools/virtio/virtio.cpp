@@ -571,6 +571,73 @@ int process_descriptor_chain_into(VirtQueue *vq, uint16_t *desc_idx,
     return chain_len;
 }
 
+int virtqueue_peek(VirtQueue *vq, uint16_t *desc_idx, struct iovec *iov,
+                   int iov_len, uint16_t *flags, int append_len,
+                   bool copy_flags) {
+    uint16_t next, last_avail_idx;
+    volatile VirtqDesc *vdesc, *ind_table, *ind_desc;
+    int chain_len = 0, i, table_len;
+
+    // idx is the last available index processed during the last kick
+    last_avail_idx = vq->last_avail_idx;
+
+    // No new requests
+    if (last_avail_idx == vq->avail_ring->idx) return 0;
+
+    // Get the index of the first available descriptor
+    *desc_idx = next = vq->avail_ring->ring[last_avail_idx & (vq->num - 1)];
+    // Record the length of the descriptor chain to chain_len
+    for (i = 0; i < (int)vq->num; i++, next = vdesc->next) {
+        // Get a descriptor
+        vdesc = &vq->desc_table[next];
+
+        if (vdesc->flags & VRING_DESC_F_INDIRECT) {
+            chain_len += vdesc->len / 16;
+            i--;
+        }
+        if ((vdesc->flags & VRING_DESC_F_NEXT) == 0) break;
+    }
+
+    // Update chain length and reset next to the first descriptor
+    chain_len += i + 1;
+    next = *desc_idx;
+
+    if (chain_len + append_len > iov_len) {
+        log_error("iov buffer too small: need %d, have %d",
+                  chain_len + append_len, iov_len);
+        // Rollback last_avail_idx because we failed to process this one?
+        // Or just let caller handle it. Usually fatal.
+        return -1;
+    }
+
+    // Traverse the descriptor chain and copy the buffer pointed to by each
+    // descriptor to iov
+    for (i = 0; i < chain_len; i++, next = vdesc->next) {
+        vdesc = &vq->desc_table[next];
+        if (vdesc->flags & VRING_DESC_F_INDIRECT) {
+            ind_table = (VirtqDesc *)(get_virt_addr((void *)vdesc->addr,
+                                                    vq->dev->zone_id));
+            table_len = vdesc->len / 16;
+            next = 0;
+            for (;;) {
+                ind_desc = &ind_table[next];
+                descriptor2iov(i, ind_desc, iov, flags == NULL ? NULL : flags,
+                               vq->dev->zone_id, copy_flags);
+                table_len--;
+                i++;
+                if ((ind_desc->flags & VRING_DESC_F_NEXT) == 0) break;
+                next = ind_desc->next;
+            }
+        } else {
+            descriptor2iov(i, vdesc, iov, flags == NULL ? NULL : flags,
+                           vq->dev->zone_id, copy_flags);
+        }
+    }
+    return chain_len;
+}
+
+void virtqueue_pop(VirtQueue *vq) { vq->last_avail_idx++; }
+
 void update_used_ring(VirtQueue *vq, uint16_t idx, uint32_t iolen) {
     volatile VirtqUsed *used_ring;
     volatile VirtqUsedElem *elem;

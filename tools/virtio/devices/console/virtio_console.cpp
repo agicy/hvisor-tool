@@ -115,54 +115,41 @@ virtio::Task console_rx_task(VirtIODevice *vdev) {
         co_await io_ctx->async_poll(dev->master_fd);
         log_info("console_rx_task signaled by poll");
 
-        virtio::IoUringContext::BatchAwaitable batch;
-        batch.ctx = io_ctx;
-        
-        awaitables.clear();
-        batch_ctxs.clear();
+        int processed_count = 0;
+        // Process available descriptors one by one
+        while (!virtqueue_is_empty(vq)) {
+            uint16_t head_idx;
+            struct console_read_ctx *ctx = &dev->rx_ctxs[vq->last_avail_idx & (vq->num - 1)];
 
-        int loop_count = 0;
-        while (loop_count < MAX_BATCH) {
-            if (virtqueue_is_empty(vq)) break;
-            
-            uint16_t last_avail_idx = vq->last_avail_idx;
-            uint16_t head_idx = vq->avail_ring->ring[last_avail_idx & (vq->num - 1)];
-            struct console_read_ctx *ctx = &dev->rx_ctxs[head_idx];
+            int n = virtqueue_peek(vq, &head_idx, ctx->iov, CONSOLE_IOV_MAX, NULL, 0, false);
+            if (n < 1) {
+                break; // Should not happen if not empty, but as a safeguard
+            }
+
             ctx->vq = vq;
-            
-            int n = process_descriptor_chain_into(vq, &ctx->idx, ctx->iov, CONSOLE_IOV_MAX, NULL, 0, false);
-            if (n < 1) break;
+            ctx->idx = head_idx;
             ctx->iovcnt = n;
-            
-            awaitables.emplace_back();
-            virtio::IoUringContext::IoAwaitable& op = awaitables.back();
-            io_ctx->prep_readv(op, dev->master_fd, ctx->iov, n, 0);
-            
-            batch_ctxs.push_back(ctx);
-            
-            loop_count++;
+
+            // Perform a single asynchronous read
+            auto awaitable = io_ctx->async_readv(dev->master_fd, ctx->iov, n, 0);
+            co_await awaitable;
+            int res = awaitable.result;
+
+            if (res > 0) {
+                // I/O was successful, now we can pop the descriptor
+                virtqueue_pop(vq);
+                update_used_ring(vq, ctx->idx, res);
+                processed_count++;
+            } else {
+                // I/O failed or would block (EAGAIN). Do not pop the descriptor.
+                // It will be retried on the next poll notification.
+                log_warn("Console read failed or got EAGAIN, result: %d. Descriptor will be retried.", res);
+                break; // Stop processing more descriptors for now
+            }
         }
-        
-        if (!awaitables.empty()) {
-            for (size_t i = 0; i < awaitables.size(); i++) {
-                batch.ops.push_back(&awaitables[i]);
-            }
-            
-            co_await batch;
-            
-            for (size_t i = 0; i < awaitables.size(); i++) {
-                int res = awaitables[i].result;
-                struct console_read_ctx *ctx = batch_ctxs[i];
-                
-                if (res > 0) {
-                    update_used_ring(vq, ctx->idx, res);
-                    virtio_inject_irq(vq);
-                } else {
-                    // For batching simplicity, drop or complete with 0 on error/EAGAIN
-                    update_used_ring(vq, ctx->idx, 0);
-                    virtio_inject_irq(vq);
-                }
-            }
+
+        if (processed_count > 0) {
+            virtio_inject_irq(vq);
         }
     }
 }
