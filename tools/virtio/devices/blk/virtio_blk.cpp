@@ -65,7 +65,9 @@ virtio::Task blk_worker_task(VirtIODevice *vdev) {
         // 使用 while 而非 if，可以防止伪唤醒
         while (!vq->ready || !vq->avail_ring) {
             if (vq->notification_event) {
+                log_info("blk_worker_task waiting ready");
                 co_await *(virtio::CoroutineEvent*)vq->notification_event;
+                log_info("blk_worker_task signaled by ready");
             } else {
                 // 如果没有事件，通常意味着严重错误或处于同步模式
                 break; 
@@ -76,8 +78,11 @@ virtio::Task blk_worker_task(VirtIODevice *vdev) {
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
             if (virtqueue_is_empty(vq)) {
-                if (vq->notification_event)
+                if (vq->notification_event){
+                    log_info("blk_worker_task waiting virtqueue notify");
                     co_await *(virtio::CoroutineEvent*)vq->notification_event;
+                    log_info("blk_worker_task signaled by virtqueue notify");
+                }
             }
             virtqueue_disable_notify(vq);
             
@@ -139,7 +144,9 @@ virtio::Task blk_worker_task(VirtIODevice *vdev) {
                 batch.ops.push_back(&awaitables[i]);
             }
             
+            log_info("blk_worker_task waiting batch");
             co_await batch;
+            log_info("blk_worker_task signaled by batch");
             
             for (size_t i = 0; i < awaitables.size(); i++) {
                 virtio_blk_complete_request(dev, batch_reqs[i], vq, awaitables[i].result);

@@ -183,8 +183,11 @@ virtio::Task console_tx_task(VirtIODevice *vdev) {
     log_info("console_tx_task looping");
     while (true) {
         while (!vq->ready || !vq->avail_ring) {
-            if (vq->notification_event)
+            if (vq->notification_event) {
+                log_info("console_tx_task waiting ready");
                 co_await *(virtio::CoroutineEvent*)vq->notification_event;
+                log_info("console_tx_task signaled by ready");
+            }
             else
                 break;
         }
@@ -192,8 +195,11 @@ virtio::Task console_tx_task(VirtIODevice *vdev) {
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
             if (virtqueue_is_empty(vq)) {
-                 if (vq->notification_event)
-                     co_await *(virtio::CoroutineEvent*)vq->notification_event;
+                if (vq->notification_event){
+                    log_info("console_tx_task waiting virtqueue notify");
+                    co_await *(virtio::CoroutineEvent*)vq->notification_event;
+                    log_info("console_tx_task signaled by virtqueue notify");
+                }
             }
             virtqueue_disable_notify(vq);
             if (!vq->ready)
@@ -233,7 +239,9 @@ virtio::Task console_tx_task(VirtIODevice *vdev) {
                 batch.ops.push_back(&awaitables[i]);
             }
             
+            log_info("console_tx_task waiting batch");
             co_await batch;
+            log_info("console_tx_task signaled by batch");
             
             for (size_t i = 0; i < awaitables.size(); i++) {
                 struct console_tx_ctx *ctx = batch_ctxs[i];

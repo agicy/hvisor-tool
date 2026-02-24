@@ -859,7 +859,7 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
             }
         }
 
-        log_debug("****** zone %d %s queue notify end ******", vdev->zone_id,
+        log_info("****** zone %d %s queue notify end ******", vdev->zone_id,
                   virtio_device_type_to_string(vdev->type));
 
         break;

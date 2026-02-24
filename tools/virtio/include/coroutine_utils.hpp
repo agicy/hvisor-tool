@@ -51,7 +51,6 @@ struct CoroutineEvent {
         }
         
         void await_suspend(std::coroutine_handle<> h) {
-            log_info("CoroutineEvent::await_suspend actual event=%p", &event);
             event.waiter = h; // 句柄被稳稳地写进了真正的本体中！
         }
         
@@ -76,7 +75,6 @@ struct CoroutineEvent {
     }
     
     void await_suspend(std::coroutine_handle<> h) {
-        log_info("CoroutineEvent::await_suspend this=%p", this);
         waiter = h;
     }
     
@@ -87,8 +85,6 @@ struct CoroutineEvent {
     }
     
     void signal() {
-        log_info("CoroutineEvent::signal this=%p, signaled=%d, waiter=%p", 
-                 this, signaled, waiter);
         signaled = true;
         if (waiter) {
             auto h = waiter;
