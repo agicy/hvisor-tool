@@ -46,6 +46,7 @@ class IoUringContext {
         int result;
         std::coroutine_handle<> handle;
         BatchAwaitable *batch = nullptr;
+        int rw_flags = 0;
 
         IoAwaitable() = default;
 
@@ -85,6 +86,7 @@ class IoUringContext {
                 break;
             case Op::Readv:
                 io_uring_prep_readv(sqe, fd, iov, iovcnt, offset);
+                sqe->rw_flags = rw_flags;
                 break;
             case Op::Writev:
                 io_uring_prep_writev(sqe, fd, iov, iovcnt, offset);
@@ -145,6 +147,7 @@ class IoUringContext {
                 case Op::Readv:
                     io_uring_prep_readv(sqe, op->fd, op->iov, op->iovcnt,
                                         op->offset);
+                    sqe->rw_flags = op->rw_flags;
                     break;
                 case Op::Writev:
                     io_uring_prep_writev(sqe, op->fd, op->iov, op->iovcnt,

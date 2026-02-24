@@ -112,6 +112,13 @@ static size_t virtio_net_get_hdr_size(VirtIODevice *vdev) {
     }
 }
 
+// 专用包装器，防止多次解析 vnet header 导致偏移被破坏
+struct StashedNetRx {
+    struct net_rx_ctx *ctx;
+    struct iovec *payload_iov;
+    int payload_iovcnt;
+};
+
 virtio::Task net_rx_task(VirtIODevice *vdev) {
     log_info("net_rx_task enter");
     NetDev *net = (NetDev*)vdev->dev;
@@ -119,52 +126,46 @@ virtio::Task net_rx_task(VirtIODevice *vdev) {
     virtio::IoUringContext* io_ctx = get_io_context();
     size_t header_len = virtio_net_get_hdr_size(vdev);
 
-    // Reuse vectors to reduce allocation
     const int MAX_BATCH = 64;
     std::vector<virtio::IoUringContext::IoAwaitable> awaitables; 
-    std::vector<struct net_rx_ctx*> batch_ctxs;
+    std::vector<StashedNetRx> batch_ctxs;
+    std::vector<StashedNetRx> stashed_ctxs; 
+
     awaitables.reserve(MAX_BATCH);
     batch_ctxs.reserve(MAX_BATCH);
+    stashed_ctxs.reserve(MAX_BATCH);
 
     log_info("net_rx_task looping");
     while (true) {
         while (!vq->ready || !vq->avail_ring) {
-            if (vq->notification_event)
-                co_await *(virtio::CoroutineEvent*)vq->notification_event;
-            else
-                break;
+            if (vq->notification_event) co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            else break;
         }
 
-        // 1. Wait for descriptors if empty
-        if (virtqueue_is_empty(vq)) {
+        while (stashed_ctxs.empty() && virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
-            if (virtqueue_is_empty(vq)) {
-                if (vq->notification_event)
-                    co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            if (virtqueue_is_empty(vq) && vq->notification_event) {
+                co_await *(virtio::CoroutineEvent*)vq->notification_event;
             }
             virtqueue_disable_notify(vq);
-            if (!vq->ready) continue;
+            if (!vq->ready) break;
         }
+        if (!vq->ready) continue;
 
         if (!net->rx_ready) {
-            // Drop packet if not ready
              co_await io_ctx->async_read(net->tapfd, trashbuf, sizeof(trashbuf), 0);
              continue;
         }
 
-        // 2. Wait for Tap readable
         co_await io_ctx->async_poll(net->tapfd);
 
-        // 3. Process packets
-        int processed_count = 0;
-        while (!virtqueue_is_empty(vq)) {
+        while (!virtqueue_is_empty(vq) && stashed_ctxs.size() < MAX_BATCH) {
             uint16_t head_idx;
             struct net_rx_ctx *ctx = &net->rx_ctxs[vq->last_avail_idx & (vq->num - 1)];
 
             int n = virtqueue_peek(vq, &head_idx, ctx->iov, NET_IOV_MAX, NULL, 0, false);
-            if (n < 1) {
-                break; // Should not happen
-            }
+            if (n < 1) break;
+            virtqueue_pop(vq);
 
             ctx->vq = vq;
             ctx->vdev = vdev;
@@ -172,37 +173,68 @@ virtio::Task net_rx_task(VirtIODevice *vdev) {
             ctx->iovcnt = n;
             ctx->vnet_header = ctx->iov[0].iov_base;
 
-            struct iovec *iov_packet = virtio_net_remove_iov_header(ctx->iov, &n, header_len);
-            if (!iov_packet) {
-                // Invalid header, pop and complete with 0
-                virtqueue_pop(vq);
+            // 这里做剥离 header 动作，只做一次。无论是否 EAGAIN 重试都不再变动
+            struct iovec *payload_iov = virtio_net_remove_iov_header(ctx->iov, &n, header_len);
+            if (!payload_iov) {
                 update_used_ring(vq, ctx->idx, 0);
-                processed_count++;
                 continue;
             }
 
-            auto awaitable = io_ctx->async_readv(net->tapfd, iov_packet, n, 0);
-            co_await awaitable;
-            int res = awaitable.result;
+            stashed_ctxs.push_back({ctx, payload_iov, n});
+        }
+
+        if (stashed_ctxs.empty()) continue;
+
+        virtio::IoUringContext::BatchAwaitable batch;
+        batch.ctx = io_ctx;
+        awaitables.clear();
+        batch_ctxs.clear();
+        int processed_count = 0;
+
+        for (auto& stashed : stashed_ctxs) {
+            awaitables.emplace_back();
+            virtio::IoUringContext::IoAwaitable& op = awaitables.back();
+            
+            io_ctx->prep_readv(op, net->tapfd, stashed.payload_iov, stashed.payload_iovcnt, 0);
+            
+            // 同样使用 NOWAIT，拒绝阻塞
+            op.rw_flags = RWF_NOWAIT;
+            batch_ctxs.push_back(stashed);
+        }
+
+        for (auto& op : awaitables) batch.ops.push_back(&op);
+        if (!batch.ops.empty()) co_await batch;
+
+        std::vector<StashedNetRx> next_stash;
+        next_stash.reserve(MAX_BATCH);
+
+        for (size_t i = 0; i < awaitables.size(); i++) {
+            int res = awaitables[i].result;
+            StashedNetRx& stashed = batch_ctxs[i];
+            struct net_rx_ctx *ctx = stashed.ctx;
 
             if (res > 0) {
-                virtqueue_pop(vq);
+                // 读取到有效的网络包，安全回填 Virtio 网络头
                 memset(ctx->vnet_header, 0, header_len);
                 if (vdev->regs.drv_feature & (1ULL << VIRTIO_F_VERSION_1)) {
                     ((NetHdr *)ctx->vnet_header)->num_buffers = 1;
                 }
                 update_used_ring(vq, ctx->idx, res + header_len);
                 processed_count++;
-            } else {
-                // EAGAIN or error, don't pop, break loop to re-poll
-                log_warn("Net read failed or got EAGAIN, result: %d. Descriptor will be retried.", res);
-                break;
+            } 
+            else if (res == -EAGAIN || res == -EWOULDBLOCK) {
+                next_stash.push_back(stashed);
+            } 
+            else {
+                log_warn("Net RX async_readv failed: %d", res);
+                update_used_ring(vq, ctx->idx, 0);
+                processed_count++;
             }
         }
 
-        if (processed_count > 0) {
-            virtio_inject_irq(vq);
-        }
+        stashed_ctxs = std::move(next_stash);
+
+        if (processed_count > 0) virtio_inject_irq(vq);
     }
 }
 
@@ -213,7 +245,6 @@ virtio::Task net_tx_task(VirtIODevice *vdev) {
     virtio::IoUringContext* io_ctx = get_io_context();
     size_t header_len = virtio_net_get_hdr_size(vdev);
 
-    // Reuse vectors
     const int MAX_BATCH = 64;
     std::vector<virtio::IoUringContext::IoAwaitable> awaitables; 
     std::vector<struct net_tx_ctx*> batch_ctxs;
@@ -223,41 +254,35 @@ virtio::Task net_tx_task(VirtIODevice *vdev) {
     log_info("net_tx_task looping");
     while (true) {
         while (!vq->ready || !vq->avail_ring) {
-            if (vq->notification_event)
-                co_await *(virtio::CoroutineEvent*)vq->notification_event;
-            else
-                break;
+            if (vq->notification_event) co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            else break;
         }
 
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
-            if (virtqueue_is_empty(vq)) {
-                 if (vq->notification_event)
-                     co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            if (virtqueue_is_empty(vq) && vq->notification_event) {
+                 co_await *(virtio::CoroutineEvent*)vq->notification_event;
             }
             virtqueue_disable_notify(vq);
-            if (!vq->ready) break; // 退出内部 while 触发外层 ready 检查
+            if (!vq->ready) break; 
         }
-        
         if (!vq->ready) continue;
 
         virtio::IoUringContext::BatchAwaitable batch;
         batch.ctx = io_ctx;
-        
         awaitables.clear();
         batch_ctxs.clear();
 
-        int loop_count = 0;
-        while (!virtqueue_is_empty(vq) && loop_count < MAX_BATCH) {
+        while (!virtqueue_is_empty(vq) && awaitables.size() < MAX_BATCH) {
             uint16_t last_avail_idx = vq->last_avail_idx;
             uint16_t head_idx = vq->avail_ring->ring[last_avail_idx & (vq->num - 1)];
             struct net_tx_ctx *ctx = &net->tx_ctxs[head_idx];
-            ctx->vq = vq;
             
             int n = process_descriptor_chain_into(vq, &ctx->idx, ctx->iov, NET_IOV_MAX, NULL, 1, false);
             if (n < 1) break;
-            
-            // Skip header
+            virtqueue_pop(vq);
+
+            // 跳过包头，TX 发送给宿主机 TAP 时无需头部
             ctx->iov[0].iov_base = (char*)ctx->iov[0].iov_base + header_len;
             ctx->iov[0].iov_len -= header_len;
             
@@ -266,22 +291,17 @@ virtio::Task net_tx_task(VirtIODevice *vdev) {
             io_ctx->prep_writev(op, net->tapfd, ctx->iov, n, 0);
             
             batch_ctxs.push_back(ctx);
-            
-            loop_count++;
         }
         
-        if (!awaitables.empty()) {
-            for (size_t i = 0; i < awaitables.size(); i++) {
-                batch.ops.push_back(&awaitables[i]);
-            }
-            
+        for (auto& op : awaitables) batch.ops.push_back(&op);
+        
+        if (!batch.ops.empty()) {
             co_await batch;
-            
             for (size_t i = 0; i < awaitables.size(); i++) {
                 struct net_tx_ctx *ctx = batch_ctxs[i];
                 update_used_ring(vq, ctx->idx, 0);
-                virtio_inject_irq(vq);
             }
+            virtio_inject_irq(vq);
         }
         io_flush();
     }

@@ -68,107 +68,105 @@ virtio::Task console_rx_task(VirtIODevice *vdev) {
     VirtQueue *vq = &vdev->vqs[CONSOLE_QUEUE_RX];
     virtio::IoUringContext* io_ctx = get_io_context();
 
-    // Move vectors outside loop
     const int MAX_BATCH = 64;
     std::vector<virtio::IoUringContext::IoAwaitable> awaitables; 
     std::vector<struct console_read_ctx*> batch_ctxs;
+    std::vector<struct console_read_ctx*> stashed_ctxs; 
+
     awaitables.reserve(MAX_BATCH);
     batch_ctxs.reserve(MAX_BATCH);
+    stashed_ctxs.reserve(MAX_BATCH);
 
     log_info("console_rx_task looping");
     while (true) {
+        // 1. 等待队列就绪
         while (!vq->ready || !vq->avail_ring) {
-            if (vq->notification_event) {
-                log_info("console_rx_task waiting ready");
-                co_await *(virtio::CoroutineEvent*)vq->notification_event;
-                log_info("console_rx_task signaled by ready");
-            }
-            else
-                break; // 理论上不会走到这里
+            if (vq->notification_event) co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            else break;
         }
 
-        while (virtqueue_is_empty(vq)) {
+        // 2. 如果手里没缓存，且队列空，等待 Guest 踢门
+        while (stashed_ctxs.empty() && virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
-            if (virtqueue_is_empty(vq)) {
-                if (vq->notification_event){
-                    log_info("console_rx_task waiting virtqueue_notify");
-                    co_await *(virtio::CoroutineEvent*)vq->notification_event;
-                    log_info("console_rx_task signaled by virtqueue_notify");
-                }
+            if (virtqueue_is_empty(vq) && vq->notification_event) {
+                co_await *(virtio::CoroutineEvent*)vq->notification_event;
             }
             virtqueue_disable_notify(vq);
-            if (!vq->ready)
-                break; // 退出内部 while 触发外层 ready 检查
+            if (!vq->ready) break; 
         }
-
-        if (!vq->ready)
-            continue; // 醒来后如果 ready 没了，回到最上面等待
+        if (!vq->ready) continue; 
 
         dev->rx_ready = 1;
 
-        if (dev->rx_ready <= 0) {
-             co_await io_ctx->async_read(dev->master_fd, trashbuf, sizeof(trashbuf), 0);
-             continue;
-        }
-
-        log_info("console_rx_task waiting poll on master_fd: %d", dev->master_fd); // level: debug
+        // 3. io_uring 纯异步事件探针，让出 CPU 直到有敲击事件
         co_await io_ctx->async_poll(dev->master_fd);
-        log_info("console_rx_task signaled by poll on master_fd: %d", dev->master_fd); // level: debug
 
-        int processed_count = 0;
-        log_info("console_rx_task starting descriptor processing, virtqueue empty: %d", virtqueue_is_empty(vq)); // level: debug
-        
-        // Process available descriptors one by one
-        while (!virtqueue_is_empty(vq)) {
+        // 4. 从环中 pop 剥夺所有权，填补缓存池直至 MAX_BATCH
+        while (!virtqueue_is_empty(vq) && stashed_ctxs.size() < MAX_BATCH) {
             uint16_t head_idx;
             struct console_read_ctx *ctx = &dev->rx_ctxs[vq->last_avail_idx & (vq->num - 1)];
 
-            log_info("console_rx_task processing descriptor at index: %d", vq->last_avail_idx); // level: debug
-
             int n = virtqueue_peek(vq, &head_idx, ctx->iov, CONSOLE_IOV_MAX, NULL, 0, false);
-            log_info("console_rx_task virtqueue_peek returned: %d descriptors, head_idx: %d", n, head_idx); // level: debug
-            
-            if (n < 1) {
-                log_warn("console_rx_task virtqueue_peek returned %d, breaking descriptor processing loop", n); // level: debug
-                break; // Should not happen if not empty, but as a safeguard
-            }
+            if (n < 1) break;
+            virtqueue_pop(vq); 
 
             ctx->vq = vq;
             ctx->idx = head_idx;
             ctx->iovcnt = n;
+            stashed_ctxs.push_back(ctx);
+        }
 
-            log_info("console_rx_task starting async_readv on master_fd: %d with %d iovecs", dev->master_fd, n); // level: debug
+        if (stashed_ctxs.empty()) continue;
+
+        // 5. 组装 io_uring 批量读请求
+        virtio::IoUringContext::BatchAwaitable batch;
+        batch.ctx = io_ctx;
+        awaitables.clear();
+        batch_ctxs.clear();
+        int processed_count = 0;
+
+        for (auto* ctx : stashed_ctxs) {
+            awaitables.emplace_back();
+            virtio::IoUringContext::IoAwaitable& op = awaitables.back();
+            io_ctx->prep_readv(op, dev->master_fd, ctx->iov, ctx->iovcnt, 0);
             
-            // Perform a single asynchronous read
-            auto awaitable = io_ctx->async_readv(dev->master_fd, ctx->iov, n, 0);
-            co_await awaitable;
-            int res = awaitable.result;
+            // RX 必须使用 NOWAIT！避免 io_uring 劫持 EAGAIN 到内核队列死等
+            op.rw_flags |= RWF_NOWAIT;
+            batch_ctxs.push_back(ctx);
+        }
 
-            log_info("console_rx_task async_readv completed with result: %d", res); // level: debug
+        for (auto& op : awaitables) batch.ops.push_back(&op);
+        
+        // 6. 一次性提交全部读请求
+        if (!batch.ops.empty()) co_await batch;
+
+        // 7. 结算批处理结果
+        std::vector<struct console_read_ctx*> next_stash;
+        next_stash.reserve(MAX_BATCH);
+
+        for (size_t i = 0; i < awaitables.size(); i++) {
+            int res = awaitables[i].result;
+            struct console_read_ctx *ctx = batch_ctxs[i];
 
             if (res > 0) {
-                // I/O was successful, now we can pop the descriptor
-                log_info("console_rx_task successful read of %d bytes, popping descriptor", res); // level: debug
-                virtqueue_pop(vq);
                 update_used_ring(vq, ctx->idx, res);
                 processed_count++;
-                log_info("console_rx_task descriptor processed successfully, total processed: %d", processed_count); // level: debug
+            } else if (res == -EAGAIN || res == -EWOULDBLOCK) {
+                // 这个盘子没装到菜，放入 next_stash 等下次吃
+                next_stash.push_back(ctx);
             } else {
-                // I/O failed or would block (EAGAIN). Do not pop the descriptor.
-                // It will be retried on the next poll notification.
-                log_warn("Console read failed or got EAGAIN, result: %d. Descriptor will be retried.", res);
-                log_info("console_rx_task breaking descriptor processing loop due to read failure", res); // level: debug
-                break; // Stop processing more descriptors for now
+                log_warn("Console RX async_readv failed: %d", res);
+                update_used_ring(vq, ctx->idx, 0);
+                processed_count++;
             }
         }
 
-        log_info("console_rx_task descriptor processing completed, total descriptors processed: %d", processed_count); // level: debug
-        
+        // 持久化缓存状态
+        stashed_ctxs = std::move(next_stash);
+
+        // 8. O(1) 中断注入
         if (processed_count > 0) {
-            log_info("console_rx_task injecting IRQ for %d processed descriptors", processed_count); // level: debug
             virtio_inject_irq(vq);
-        } else {
-            log_info("console_rx_task no descriptors processed, skipping IRQ injection"); // level: debug
         }
     }
 }
@@ -179,7 +177,6 @@ virtio::Task console_tx_task(VirtIODevice *vdev) {
     VirtQueue *vq = &vdev->vqs[CONSOLE_QUEUE_TX];
     virtio::IoUringContext* io_ctx = get_io_context();
 
-    // Move vectors outside loop
     const int MAX_BATCH = 64;
     std::vector<virtio::IoUringContext::IoAwaitable> awaitables; 
     std::vector<struct console_tx_ctx*> batch_ctxs;
@@ -189,71 +186,55 @@ virtio::Task console_tx_task(VirtIODevice *vdev) {
     log_info("console_tx_task looping");
     while (true) {
         while (!vq->ready || !vq->avail_ring) {
-            if (vq->notification_event) {
-                log_info("console_tx_task waiting ready");
-                co_await *(virtio::CoroutineEvent*)vq->notification_event;
-                log_info("console_tx_task signaled by ready");
-            }
-            else
-                break;
+            if (vq->notification_event) co_await *(virtio::CoroutineEvent*)vq->notification_event;
+            else break;
         }
 
         while (virtqueue_is_empty(vq)) {
             virtqueue_enable_notify(vq);
-            if (virtqueue_is_empty(vq)) {
-                if (vq->notification_event){
-                    log_info("console_tx_task waiting virtqueue notify");
-                    co_await *(virtio::CoroutineEvent*)vq->notification_event;
-                    log_info("console_tx_task signaled by virtqueue notify");
-                }
+            if (virtqueue_is_empty(vq) && vq->notification_event) {
+                co_await *(virtio::CoroutineEvent*)vq->notification_event;
             }
             virtqueue_disable_notify(vq);
-            if (!vq->ready)
-                break; // 退出内部 while 触发外层 ready 检查
+            if (!vq->ready) break; 
         }
-        
-        if (!vq->ready) continue; // 醒来后如果 ready 没了，回到最上面等待
+        if (!vq->ready) continue; 
 
         virtio::IoUringContext::BatchAwaitable batch;
         batch.ctx = io_ctx;
-        
         awaitables.clear();
         batch_ctxs.clear();
 
-        int loop_count = 0;
-        while (!virtqueue_is_empty(vq) && loop_count < MAX_BATCH) {
-            uint16_t last_avail_idx = vq->last_avail_idx;
-            uint16_t head_idx = vq->avail_ring->ring[last_avail_idx & (vq->num - 1)];
-            struct console_tx_ctx *ctx = &dev->tx_ctxs[head_idx];
-            ctx->vq = vq;
+        // TX 的逻辑极其顺畅，有多少发多少，发不出去就让内核排队（天然背压）
+        while (!virtqueue_is_empty(vq) && awaitables.size() < MAX_BATCH) {
+            uint16_t head_idx;
+            struct console_tx_ctx *ctx = &dev->tx_ctxs[vq->last_avail_idx & (vq->num - 1)];
             
             int n = process_descriptor_chain_into(vq, &ctx->idx, ctx->iov, CONSOLE_IOV_MAX, NULL, 1, false);
             if (n < 1) break;
+            virtqueue_pop(vq);
+
+            ctx->vq = vq;
             ctx->iovcnt = n;
             
             awaitables.emplace_back();
             virtio::IoUringContext::IoAwaitable& op = awaitables.back();
+            
+            // TX 切记【不要】添加 RWF_NOWAIT，依赖 io_uring 自动排队！
             io_ctx->prep_writev(op, dev->master_fd, ctx->iov, n, 0);
-            
             batch_ctxs.push_back(ctx);
-            
-            loop_count++;
         }
         
-        if (!awaitables.empty()) {
-             for (size_t i = 0; i < awaitables.size(); i++) {
-                batch.ops.push_back(&awaitables[i]);
-            }
-            
-            log_info("console_tx_task waiting batch");
+        for (auto& op : awaitables) batch.ops.push_back(&op);
+        
+        if (!batch.ops.empty()) {
             co_await batch;
-            log_info("console_tx_task signaled by batch");
-            
             for (size_t i = 0; i < awaitables.size(); i++) {
                 struct console_tx_ctx *ctx = batch_ctxs[i];
+                // 对于 TX，直接确认处理完毕即可
                 update_used_ring(vq, ctx->idx, 0);
-                virtio_inject_irq(vq);
             }
+            virtio_inject_irq(vq);
         }
         io_flush();
     }
