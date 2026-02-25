@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/queue.h>
+#include <liburing.h>
 
 /// Maximum number of segments in a request.
 #define BLK_SEG_MAX 512
@@ -46,10 +47,11 @@ typedef struct virtio_blk_dev {
     int img_fd;
     // describe the worker thread that executes read, write and ioctl.
     pthread_t tid;
-    pthread_mutex_t mtx;
-    pthread_cond_t cond;
-    TAILQ_HEAD(, blkp_req) procq;
     int close;
+
+    // TODO:
+    struct io_uring ring;
+    int kick_fd;
 } BlkDev;
 
 BlkDev *init_blk_dev(VirtIODevice *vdev);
