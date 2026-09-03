@@ -465,6 +465,17 @@ static int handle_clock_config_set(SCMIDev *dev, uint16_t token,
     int ret =
         hvisor_scmi_ioctl_cmd(HVISOR_SCMI_CLOCK_IOCTL, &args, sizeof(args),
                               HVISOR_SCMI_CLOCK_CONFIG_SET, "clock");
+    if (ret == 0 && dev->clk_en_cnt &&
+        r->clock_id < dev->clock_count) {
+        /* Record what this zone enabled so zone shutdown can undo exactly
+         * this zone's contribution (shared clocks stay untouched). */
+        pthread_mutex_lock(&dev->res_lock);
+        if (r->attributes == 1)
+            dev->clk_en_cnt[r->clock_id]++;
+        else if (dev->clk_en_cnt[r->clock_id] > 0)
+            dev->clk_en_cnt[r->clock_id]--;
+        pthread_mutex_unlock(&dev->res_lock);
+    }
     if (ret < 0) {
         return scmi_make_response(ctx, SCMI_PROTO_ID_CLOCK,
                                   SCMI_CLOCK_MSG_CONFIG_SET, token,

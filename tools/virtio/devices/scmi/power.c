@@ -186,6 +186,17 @@ static int handle_power_state_set(SCMIDev *dev, uint16_t token,
     int ret =
         hvisor_scmi_ioctl_cmd(HVISOR_SCMI_POWER_IOCTL, &args, sizeof(args),
                               HVISOR_SCMI_POWER_STATE_SET, "power");
+    if (ret == 0 && dev->pwr_on_cnt &&
+        domain_id < dev->power_count) {
+        /* Record what this zone powered on so zone shutdown can undo
+         * exactly this zone's contribution. */
+        pthread_mutex_lock(&dev->res_lock);
+        if (power_state == SCMI_POWER_STATE_GENERIC_ON)
+            dev->pwr_on_cnt[domain_id]++;
+        else if (dev->pwr_on_cnt[domain_id] > 0)
+            dev->pwr_on_cnt[domain_id]--;
+        pthread_mutex_unlock(&dev->res_lock);
+    }
     if (ret < 0) {
         return scmi_make_response(ctx, SCMI_PROTO_ID_POWER,
                                   SCMI_POWER_MSG_POWER_STATE_SET, token,

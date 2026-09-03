@@ -12,6 +12,7 @@
 #define _HVISOR_VIRTIO_SCMI_H
 
 #include "virtio.h"
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -157,6 +158,13 @@ typedef struct virtio_scmi_dev {
     uint32_t power_count;
     struct scmi_dev_protocol_entry protocols[SCMI_MAX_PROTOCOLS];
     int protocol_count;
+    /* Per-request attribution of what this zone actually enabled/powered on
+     * through SCMI (parallel to clock_ids/power_ids, indexed by the guest's
+     * logical id). Zone shutdown releases exactly these, so clocks/domains
+     * shared with other zones or with the root OS are never touched. */
+    uint32_t *clk_en_cnt;
+    uint32_t *pwr_on_cnt;
+    pthread_mutex_t res_lock;
 } SCMIDev;
 
 enum scmi_error_codes {
