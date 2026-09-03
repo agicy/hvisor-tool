@@ -274,3 +274,9 @@ int hvisor_scmi_ioctl_cmd(int ioctl_cmd, void *args, size_t args_size,
 extern const struct virtio_config_ops virtio_scmi_config_ops;
 
 #endif
+
+/* Zone lifecycle: called when a zone is shut down. Disables every clock the
+ * zone may have enabled through SCMI and powers off every domain it powered
+ * on, so passthrough hardware (e.g. VOP/GPU) is quiesced instead of being
+ * left running into the next boot of the zone. */
+int scmi_dev_release_zone(SCMIDev *dev);

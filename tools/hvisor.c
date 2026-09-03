@@ -1047,6 +1047,17 @@ static int zone_shutdown(int argc, char *argv[]) {
     if (err)
         perror("zone_shutdown: ioctl failed");
     close(fd);
+    if (err == 0) {
+        /* Tell the virtio daemon to release this zone's scmi resources
+         * (disable its clocks, power off its domains) so the passthrough
+         * hardware is quiesced before the zone is started again. */
+        extern int virtio_notify_zone_shutdown(int zone_id);
+        if (virtio_notify_zone_shutdown((int)zone_id) != 0)
+            fprintf(stderr,
+                    "zone_shutdown: daemon not reachable, scmi resources "
+                    "not released (zone %lu)\n",
+                    zone_id);
+    }
     return err;
 }
 

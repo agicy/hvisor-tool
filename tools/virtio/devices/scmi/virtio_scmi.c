@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 
 #include "virtio_scmi.h"
+#include "hvisor.h"
 #include "json_parse.h"
 #include "log.h"
 #include "safe_cjson.h"
@@ -292,3 +293,75 @@ const struct virtio_config_ops virtio_scmi_config_ops = {
     .parse = virtio_scmi_parse_params,
     .free = virtio_scmi_free_params,
 };
+
+int scmi_dev_release_zone(SCMIDev *dev) {
+    struct hvisor_scmi_clock_args cargs;
+    struct hvisor_scmi_power_args pargs;
+    uint32_t i;
+    int n_disabled = 0, n_off = 0;
+
+    if (!dev)
+        return -1;
+
+    /* 1. Disable clocks first: stops the display/GPU scanout, which removes
+     *    the source of stale DMA/page-fault interrupts. The enable count may
+     *    be > 1 if the guest enabled a clock several times, so drain until
+     *    the clock reports disabled (bounded). */
+    for (i = 0; i < dev->clock_count; i++) {
+        for (int k = 0; k < 8; k++) {
+            memset(&cargs, 0, sizeof(cargs));
+            cargs.u.clock_config_info.clock_id = dev->clock_ids[i];
+            if (hvisor_scmi_ioctl_cmd(HVISOR_SCMI_CLOCK_IOCTL, &cargs,
+                                      sizeof(cargs),
+                                      HVISOR_SCMI_CLOCK_CONFIG_GET,
+                                      "clock") < 0)
+                break;
+            if (!cargs.u.clock_config_info.config)
+                break; /* already disabled */
+            memset(&cargs, 0, sizeof(cargs));
+            cargs.u.clock_config_info.clock_id = dev->clock_ids[i];
+            cargs.u.clock_config_info.config = 0;
+            if (hvisor_scmi_ioctl_cmd(HVISOR_SCMI_CLOCK_IOCTL, &cargs,
+                                      sizeof(cargs),
+                                      HVISOR_SCMI_CLOCK_CONFIG_SET,
+                                      "clock") < 0) {
+                log_warn("scmi release: failed to disable clock %u",
+                         dev->clock_ids[i]);
+                break;
+            }
+            n_disabled++;
+        }
+    }
+
+    /* 2. Power off the domains the zone powered on (VOP/GPU/USB...). This is
+     *    the hardware reset: any residual register/interrupt state in the
+     *    power domain is gone for the next boot. */
+    for (i = 0; i < dev->power_count; i++) {
+        memset(&pargs, 0, sizeof(pargs));
+        pargs.u.power_state_info.domain_id = dev->power_ids[i];
+        if (hvisor_scmi_ioctl_cmd(HVISOR_SCMI_POWER_IOCTL, &pargs,
+                                  sizeof(pargs),
+                                  HVISOR_SCMI_POWER_STATE_GET,
+                                  "power") < 0)
+            continue;
+        if (pargs.u.power_state_info.power_state ==
+            SCMI_POWER_STATE_GENERIC_OFF)
+            continue; /* already off */
+        memset(&pargs, 0, sizeof(pargs));
+        pargs.u.power_state_info.domain_id = dev->power_ids[i];
+        pargs.u.power_state_info.power_state = SCMI_POWER_STATE_GENERIC_OFF;
+        if (hvisor_scmi_ioctl_cmd(HVISOR_SCMI_POWER_IOCTL, &pargs,
+                                  sizeof(pargs),
+                                  HVISOR_SCMI_POWER_STATE_SET,
+                                  "power") < 0) {
+            log_warn("scmi release: failed to power off domain %u",
+                     dev->power_ids[i]);
+            continue;
+        }
+        n_off++;
+    }
+
+    log_info("scmi release: disabled %d clock(s), powered off %d domain(s)",
+             n_disabled, n_off);
+    return 0;
+}
