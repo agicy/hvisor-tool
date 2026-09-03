@@ -12,7 +12,6 @@
 #define _HVISOR_VIRTIO_SCMI_H
 
 #include "virtio.h"
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -158,13 +157,10 @@ typedef struct virtio_scmi_dev {
     uint32_t power_count;
     struct scmi_dev_protocol_entry protocols[SCMI_MAX_PROTOCOLS];
     int protocol_count;
-    /* Per-request attribution of what this zone actually enabled/powered on
-     * through SCMI (parallel to clock_ids/power_ids, indexed by the guest's
-     * logical id). Zone shutdown releases exactly these, so clocks/domains
-     * shared with other zones or with the root OS are never touched. */
-    uint32_t *clk_en_cnt;
-    uint32_t *pwr_on_cnt;
-    pthread_mutex_t res_lock;
+    /* Zone this device serves; stamped on every scmi ioctl so the kernel
+     * driver can account resources per zone and release them when the zone
+     * is (re)started or shut down. */
+    uint32_t zone_id;
 } SCMIDev;
 
 enum scmi_error_codes {
@@ -282,9 +278,3 @@ int hvisor_scmi_ioctl_cmd(int ioctl_cmd, void *args, size_t args_size,
 extern const struct virtio_config_ops virtio_scmi_config_ops;
 
 #endif
-
-/* Zone lifecycle: called when a zone is shut down. Disables every clock the
- * zone may have enabled through SCMI and powers off every domain it powered
- * on, so passthrough hardware (e.g. VOP/GPU) is quiesced instead of being
- * left running into the next boot of the zone. */
-int scmi_dev_release_zone(SCMIDev *dev);

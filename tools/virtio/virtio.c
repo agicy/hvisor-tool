@@ -62,7 +62,6 @@ int vdevs_num;
 
 #define VIRTIO_CTRL_SOCKET_PATH "/run/hvisor-virtio.sock"
 #define VIRTIO_CTRL_OP_ADD "add"
-#define VIRTIO_CTRL_OP_DEL "del"
 #define VIRTIO_CTRL_MSG_LEN 256
 
 typedef struct virtio_control_request {
@@ -1990,8 +1989,6 @@ static void fill_control_response(VirtioControlResponse *resp, int status,
     snprintf(resp->message, sizeof(resp->message), "%s", message);
 }
 
-static int virtio_del_zone(int zone_id);
-
 static void handle_control_client(int client_fd) {
     VirtioControlRequest req;
     VirtioControlResponse resp;
@@ -2000,22 +1997,13 @@ static void handle_control_client(int client_fd) {
         return;
     req.op[sizeof(req.op) - 1] = '\0';
     req.json_path[sizeof(req.json_path) - 1] = '\0';
-    if (strcmp(req.op, VIRTIO_CTRL_OP_ADD) == 0) {
-        if (virtio_add_from_json(req.json_path) != 0)
-            fill_control_response(&resp, -1, "virtio add failed");
-        else
-            fill_control_response(&resp, 0, "virtio add succeeded");
-    } else if (strcmp(req.op, VIRTIO_CTRL_OP_DEL) == 0) {
-        char *end = NULL;
-        unsigned long zone_id = strtoul(req.json_path, &end, 0);
-        if (req.json_path[0] == '\0' || (end && *end != '\0') ||
-            virtio_del_zone((int)zone_id) != 0)
-            fill_control_response(&resp, -1, "virtio del failed");
-        else
-            fill_control_response(&resp, 0, "virtio del succeeded");
-    } else
+    if (strcmp(req.op, VIRTIO_CTRL_OP_ADD) != 0)
         fill_control_response(&resp, -1,
                               "unsupported virtio control operation");
+    else if (virtio_add_from_json(req.json_path) != 0)
+        fill_control_response(&resp, -1, "virtio add failed");
+    else
+        fill_control_response(&resp, 0, "virtio add succeeded");
     if (atomic_load(&ctrl_running))
         write_full(client_fd, &resp, sizeof(resp));
 }
@@ -2168,63 +2156,5 @@ int virtio_add(int argc, char *argv[]) {
     }
     close(fd);
     printf("%s\n", resp.message);
-    return resp.status;
-}
-
-/* Release the virtio-scmi resources (clocks/power domains) held by a zone
- * that is being shut down, so passthrough hardware is left quiescent for the
- * zone's next boot. */
-static int virtio_del_zone(int zone_id) {
-    SCMIDev *scmi_devs[MAX_DEVS];
-    int n = 0;
-    int i;
-
-    pthread_mutex_lock(&VDEV_MUTEX);
-    for (i = 0; i < vdevs_num; i++) {
-        if (!vdevs[i] || vdevs[i]->zone_id != (uint32_t)zone_id)
-            continue;
-        if (vdevs[i]->type == VirtioTSCMI && vdevs[i]->dev &&
-            n < MAX_DEVS)
-            scmi_devs[n++] = (SCMIDev *)vdevs[i]->dev;
-    }
-    pthread_mutex_unlock(&VDEV_MUTEX);
-
-    for (i = 0; i < n; i++)
-        scmi_dev_release_zone(scmi_devs[i]);
-    log_info("virtio del: released scmi resources of zone %d (%d device(s))",
-             zone_id, n);
-    return 0;
-}
-
-/* Client side: notify the running daemon that a zone has been shut down so
- * it can release the zone's virtio-scmi resources. Best-effort: returns 0
- * even when no daemon is reachable. */
-int virtio_notify_zone_shutdown(int zone_id) {
-    VirtioControlRequest req;
-    VirtioControlResponse resp;
-    struct sockaddr_un addr;
-    int fd;
-
-    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0)
-        return -1;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s",
-             VIRTIO_CTRL_SOCKET_PATH);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        return -1;
-    }
-    memset(&req, 0, sizeof(req));
-    snprintf(req.op, sizeof(req.op), "%s", VIRTIO_CTRL_OP_DEL);
-    snprintf(req.json_path, sizeof(req.json_path), "%d", zone_id);
-    if (write_full(fd, &req, sizeof(req)) != sizeof(req) ||
-        read_full(fd, &resp, sizeof(resp)) != sizeof(resp)) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    log_info("zone shutdown notify: %s", resp.message);
     return resp.status;
 }
