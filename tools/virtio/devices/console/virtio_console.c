@@ -21,7 +21,6 @@
 #include <sys/time.h>
 #include <termios.h>
 
-static uint8_t trashbuf[1024];
 
 static ConsoleDev *init_console_dev() {
     ConsoleDev *dev = (ConsoleDev *)malloc(sizeof(ConsoleDev));
@@ -32,6 +31,7 @@ static ConsoleDev *init_console_dev() {
     dev->master_fd = -1;
     dev->slave_keepalive_fd = -1;
     dev->rx_ready = -1;
+    dev->rx_poll = 0;
     dev->event = NULL;
     dev->tx_blocked = 0;
     pthread_mutex_init(&dev->tx_lock, NULL);
@@ -71,15 +71,62 @@ static int console_tx_drain(ConsoleDev *dev, VirtQueue *vq) {
     return 0;
 }
 
+/* Update the pty master epoll interest from the current device state:
+ * EPOLLIN only while the guest has RX buffers queued (rx_poll), EPOLLOUT
+ * while a TX chain is waiting for the pty to drain. */
+static void console_update_interest(ConsoleDev *dev) {
+    int events = 0;
+
+    if (!dev->event)
+        return;
+    if (dev->rx_poll)
+        events |= EPOLLIN;
+    if (dev->tx_blocked)
+        events |= EPOLLOUT;
+    update_event_interest(dev->event, events);
+}
+
+/* Drain as much pty input as the guest RX queue can hold.
+ * Returns -EAGAIN if more input may still be pending (no more guest bufs). */
+static int console_rx_drain(ConsoleDev *dev, VirtQueue *vq) {
+    int n;
+    uint16_t idx;
+    ssize_t len;
+    struct iovec *iov = NULL;
+    int ret = 0;
+
+    while (!virtqueue_is_empty(vq)) {
+        n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
+        if (n < 1) {
+            log_error("process_descriptor_chain failed");
+            break;
+        }
+        len = readv(dev->master_fd, iov, n);
+        if (len < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
+            /* pty input drained */
+            vq->last_avail_idx--;
+            free(iov);
+            ret = -EAGAIN;
+            break;
+        } else if (len < 0) {
+            log_debug("Failed to read from console, errno is %d", errno);
+            vq->last_avail_idx--;
+            free(iov);
+            ret = -EAGAIN;
+            break;
+        }
+        update_used_ring(vq, idx, len);
+        free(iov);
+    }
+    return ret;
+}
+
 static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     // log_debug("%s", __func__);
     VirtIODevice *vdev = (VirtIODevice *)param;
     VirtQueue *vq;
     ConsoleDev *dev;
-    int n;
-    ssize_t len;
-    struct iovec *iov = NULL;
-    uint16_t idx;
+    int drained;
 
     if (!vdev || !vdev->dev || vdev->type != VirtioTConsole)
         return;
@@ -93,47 +140,36 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
             vq = &vdev->vqs[CONSOLE_QUEUE_TX];
             if (console_tx_drain(dev, vq) == 0) {
                 dev->tx_blocked = 0;
-                if (dev->event)
-                    update_event_interest(dev->event, EPOLLIN);
+                console_update_interest(dev);
             }
         }
         pthread_mutex_unlock(&dev->tx_lock);
     }
 
-    if (!(epoll_type & EPOLLIN))
+    if (!(epoll_type & EPOLLIN) || !dev->rx_poll)
         return;
 
     vq = &vdev->vqs[CONSOLE_QUEUE_RX];
-    if (dev->rx_ready <= 0) {
-        read(dev->master_fd, trashbuf, sizeof(trashbuf));
-        return;
-    }
-    if (virtqueue_is_empty(vq)) {
-        read(dev->master_fd, trashbuf, sizeof(trashbuf));
+    if (dev->rx_ready <= 0 || virtqueue_is_empty(vq)) {
+        /* No guest buffer to accept input: keep the data in the pty input
+         * queue (never drop it into a trash buffer) and stop watching until
+         * the guest kicks the RX queue again with fresh buffers. */
+        dev->rx_poll = 0;
+        console_update_interest(dev);
         virtio_inject_irq(vq);
         return;
     }
 
-    while (!virtqueue_is_empty(vq)) {
-        n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
-        if (n < 1) {
-            log_error("process_descriptor_chain failed");
-            break;
-        }
-        len = readv(dev->master_fd, iov, n);
-        if (len < 0 && errno == EWOULDBLOCK) {
-            log_debug("no more bytes");
-            vq->last_avail_idx--;
-            free(iov);
-            break;
-        } else if (len < 0) {
-            log_debug("Failed to read from console, errno is %d", errno);
-            vq->last_avail_idx--;
-            free(iov);
-            break;
-        }
-        update_used_ring(vq, idx, len);
-        free(iov);
+    drained = console_rx_drain(dev, vq);
+    if (virtqueue_is_empty(vq)) {
+        /* All guest buffers consumed; more input may still sit in the pty.
+         * Unarm EPOLLIN and let the guest's next RX kick re-arm it. */
+        dev->rx_poll = 0;
+        console_update_interest(dev);
+    } else if (drained == -EAGAIN) {
+        /* pty drained but buffers remain: stay armed for the next byte */
+        dev->rx_poll = 1;
+        console_update_interest(dev);
     }
     virtio_inject_irq(vq);
     return;
@@ -209,6 +245,13 @@ static int virtio_console_rxq_notify_handler(VirtIODevice *vdev,
     if (dev->rx_ready <= 0) {
         dev->rx_ready = 1;
         virtqueue_disable_notify(vq);
+    }
+    /* Guest queued RX buffers: resume watching the pty master. Level-
+     * triggered epoll fires immediately if input is already pending, so
+     * data that arrived while unarmed is drained here. */
+    if (!dev->rx_poll) {
+        dev->rx_poll = 1;
+        console_update_interest(dev);
     }
     return 0;
 }

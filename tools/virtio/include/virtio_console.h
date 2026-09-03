@@ -28,6 +28,7 @@ typedef struct virtio_console_dev {
     int master_fd;
     int slave_keepalive_fd;
     int rx_ready;
+    int rx_poll;
     struct hvisor_event *event;
     /* Serializes guest TX (mmio notify thread) with the EPOLLOUT retry
      * drain (epoll thread). */
