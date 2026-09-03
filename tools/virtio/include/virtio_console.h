@@ -13,6 +13,7 @@
 #include "event_monitor.h"
 #include "virtio.h"
 #include <linux/virtio_console.h>
+#include <pthread.h>
 
 #define CONSOLE_SUPPORTED_FEATURES                                             \
     ((1ULL << VIRTIO_F_VERSION_1) | (1ULL << VIRTIO_CONSOLE_F_SIZE))
@@ -28,6 +29,12 @@ typedef struct virtio_console_dev {
     int slave_keepalive_fd;
     int rx_ready;
     struct hvisor_event *event;
+    /* Serializes guest TX (mmio notify thread) with the EPOLLOUT retry
+     * drain (epoll thread). */
+    pthread_mutex_t tx_lock;
+    /* A TX chain was left unconsumed because the pty was full; wait for
+     * EPOLLOUT before draining again instead of dropping guest output. */
+    int tx_blocked;
 } ConsoleDev;
 
 extern const struct virtio_device_ops virtio_console_ops;

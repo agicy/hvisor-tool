@@ -326,9 +326,10 @@ static void virtio_net_close(VirtIODevice *vdev) {
         dev->tapfd = -1;
         if (dev->event) {
             remove_event(dev->event);
-            free(dev->event);
             dev->event = NULL;
         }
+        /* make sure no event handler is still running on this device */
+        event_barrier();
         free(dev->in_iov);
         free(dev->out_iov);
         free(dev);

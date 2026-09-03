@@ -33,27 +33,77 @@ static ConsoleDev *init_console_dev() {
     dev->slave_keepalive_fd = -1;
     dev->rx_ready = -1;
     dev->event = NULL;
+    dev->tx_blocked = 0;
+    pthread_mutex_init(&dev->tx_lock, NULL);
     return dev;
+}
+
+static int console_tx_drain(ConsoleDev *dev, VirtQueue *vq) {
+    int n;
+    uint16_t idx;
+    ssize_t len;
+    struct iovec *iov = NULL;
+
+    if (dev->master_fd <= 0)
+        return 0;
+
+    while (!virtqueue_is_empty(vq)) {
+        n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
+        if (n < 1)
+            break;
+
+        len = writev(dev->master_fd, iov, n);
+        if (len < 0) {
+            int err = errno;
+            if (err == EAGAIN || err == EWOULDBLOCK) {
+                /* pty input queue full (no reader attached, or reader
+                 * stalled): keep the descriptor and retry once the slave
+                 * side drains (EPOLLOUT) instead of dropping guest data. */
+                vq->last_avail_idx--;
+                free(iov);
+                return -EAGAIN;
+            }
+            log_error("Failed to write to console, errno is %d", err);
+        }
+        update_used_ring(vq, idx, 0);
+        free(iov);
+    }
+    return 0;
 }
 
 static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     // log_debug("%s", __func__);
     VirtIODevice *vdev = (VirtIODevice *)param;
-    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
-    VirtQueue *vq = &vdev->vqs[CONSOLE_QUEUE_RX];
+    VirtQueue *vq;
+    ConsoleDev *dev;
     int n;
     ssize_t len;
     struct iovec *iov = NULL;
     uint16_t idx;
 
-    if (fd != dev->master_fd || !(epoll_type & EPOLLIN)) {
-        log_error("Invalid console event");
+    if (!vdev || !vdev->dev || vdev->type != VirtioTConsole)
         return;
-    }
-    if (dev->master_fd <= 0 || vdev->type != VirtioTConsole) {
-        log_error("console event handler should not be called");
+    dev = (ConsoleDev *)vdev->dev;
+    if (fd != dev->master_fd || dev->master_fd <= 0)
         return;
+
+    if (epoll_type & EPOLLOUT) {
+        pthread_mutex_lock(&dev->tx_lock);
+        if (dev->tx_blocked) {
+            vq = &vdev->vqs[CONSOLE_QUEUE_TX];
+            if (console_tx_drain(dev, vq) == 0) {
+                dev->tx_blocked = 0;
+                if (dev->event)
+                    update_event_interest(dev->event, EPOLLIN);
+            }
+        }
+        pthread_mutex_unlock(&dev->tx_lock);
     }
+
+    if (!(epoll_type & EPOLLIN))
+        return;
+
+    vq = &vdev->vqs[CONSOLE_QUEUE_RX];
     if (dev->rx_ready <= 0) {
         read(dev->master_fd, trashbuf, sizeof(trashbuf));
         return;
@@ -163,40 +213,31 @@ static int virtio_console_rxq_notify_handler(VirtIODevice *vdev,
     return 0;
 }
 
-static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
-    int n;
-    uint16_t idx;
-    ssize_t len;
-    struct iovec *iov = NULL;
-    if (dev->master_fd <= 0) {
-        log_error("Console master fd is not ready");
-        return;
-    }
-
-    n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
-
-    if (n < 1) {
-        return;
-    }
-
-    len = writev(dev->master_fd, iov, n);
-    if (len < 0) {
-        log_error("Failed to write to console, errno is %d", errno);
-    }
-    update_used_ring(vq, idx, 0);
-    free(iov);
-}
-
 static int virtio_console_txq_notify_handler(VirtIODevice *vdev,
                                              VirtQueue *vq) {
     log_debug("%s", __func__);
-    while (!virtqueue_is_empty(vq)) {
-        virtqueue_disable_notify(vq);
+    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
+    int rc;
+
+    if (!dev)
+        return 0;
+
+    pthread_mutex_lock(&dev->tx_lock);
+    if (!dev->tx_blocked) {
         while (!virtqueue_is_empty(vq)) {
-            virtq_tx_handle_one_request(vdev->dev, vq);
+            virtqueue_disable_notify(vq);
+            rc = console_tx_drain(dev, vq);
+            virtqueue_enable_notify(vq);
+            if (rc == -EAGAIN) {
+                /* pty full: stop draining here, resume on EPOLLOUT */
+                dev->tx_blocked = 1;
+                if (dev->event)
+                    update_event_interest(dev->event, EPOLLIN | EPOLLOUT);
+                break;
+            }
         }
-        virtqueue_enable_notify(vq);
     }
+    pthread_mutex_unlock(&dev->tx_lock);
     virtio_inject_irq(vq);
     return 0;
 }
@@ -214,7 +255,9 @@ static void virtio_console_close(VirtIODevice *vdev) {
         if (dev->slave_keepalive_fd >= 0)
             close(dev->slave_keepalive_fd);
         remove_event(dev->event);
-        free(dev->event);
+        dev->event = NULL;
+        /* make sure no event handler is still running on this device */
+        event_barrier();
         free(dev);
         vdev->dev = NULL;
     }
