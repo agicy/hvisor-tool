@@ -78,15 +78,10 @@ static void net_update_interest(NetDev *net) {
 static int virtio_net_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     log_debug("virtio_net_rxq_notify_handler");
     NetDev *net = vdev->dev;
-    if (net->rx_ready <= 0) {
-        net->rx_ready = 1;
-        // When buffers are all used, virtio_net_event_handler will notify the
-        // driver.
-        virtqueue_disable_notify(vq);
-    }
     /* Guest queued RX buffers: resume watching the tap.  Level-triggered
      * epoll fires immediately if packets are already pending, so data that
      * arrived while unarmed is drained right away. */
+    net->rx_ready = 1;
     if (!net->rx_poll) {
         net->rx_poll = 1;
         net_update_interest(net);
