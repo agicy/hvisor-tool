@@ -32,6 +32,7 @@ static NetDev *init_net_dev(const uint8_t mac[]) {
     dev->config.status = VIRTIO_NET_S_LINK_UP;
     dev->tapfd = -1;
     dev->rx_ready = 0;
+    dev->rx_poll = 0;
     dev->event = NULL;
     dev->in_iov = NULL;
     dev->out_iov = NULL;
@@ -63,6 +64,16 @@ static int open_tap(const char *devname) {
     return tunfd;
 }
 
+/* Update the tap epoll interest from the current device state: watch
+ * EPOLLIN only while the guest has RX buffers queued (rx_poll).  Unarmed,
+ * packets stay queued in the kernel tap buffer instead of being trashed;
+ * the guest's next RX kick re-arms us. */
+static void net_update_interest(NetDev *net) {
+    if (!net->event)
+        return;
+    update_event_interest(net->event, net->rx_poll ? EPOLLIN : 0);
+}
+
 /// When driver notifies rxq, it means the rx process can now begin
 static int virtio_net_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     log_debug("virtio_net_rxq_notify_handler");
@@ -72,6 +83,13 @@ static int virtio_net_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
         // When buffers are all used, virtio_net_event_handler will notify the
         // driver.
         virtqueue_disable_notify(vq);
+    }
+    /* Guest queued RX buffers: resume watching the tap.  Level-triggered
+     * epoll fires immediately if packets are already pending, so data that
+     * arrived while unarmed is drained right away. */
+    if (!net->rx_poll) {
+        net->rx_poll = 1;
+        net_update_interest(net);
     }
     return 0;
 }
@@ -101,15 +119,18 @@ static void virtio_net_event_handler(int fd, int epoll_type, void *param) {
         return;
     }
 
-    // if vq is not setup, drop the packet
-    uint8_t trashbuf[1600];
-    if (!net->rx_ready) {
-        read(net->tapfd, trashbuf, sizeof(trashbuf));
+    /* Never read from the tap while the guest has no RX buffers queued.
+     * Level-triggered epoll would otherwise re-fire immediately with data
+     * pending, and the old trash-buffer path dropped the stream one packet
+     * at a time until the guest refilled - enough loss to collapse TCP on
+     * large transfers.  Packets now stay queued in the kernel tap buffer;
+     * the guest's next RX kick re-arms EPOLLIN. */
+    if (!net->rx_poll) {
         return;
     }
-    // if rx_vq is empty, drop the packet
-    if (virtqueue_is_empty(vq)) {
-        read(net->tapfd, trashbuf, sizeof(trashbuf));
+    if (net->rx_ready <= 0 || virtqueue_is_empty(vq)) {
+        net->rx_poll = 0;
+        net_update_interest(net);
         virtio_inject_irq(vq);
         return;
     }
@@ -170,6 +191,15 @@ static void virtio_net_event_handler(int fd, int epoll_type, void *param) {
 
     if (batch_count > 0)
         update_used_ring_batch(vq, batch_indices, batch_lens, batch_count);
+
+    if (net->rx_ready == 0 || virtqueue_is_empty(vq)) {
+        /* All guest RX buffers consumed (or the tap went away): stop
+         * watching the tap so level-triggered epoll cannot spin on queued
+         * packets.  Data stays in the kernel tap buffer until the guest's
+         * next RX kick re-arms EPOLLIN - nothing is dropped. */
+        net->rx_poll = 0;
+        net_update_interest(net);
+    }
     virtio_inject_irq(vq);
 }
 
@@ -275,6 +305,8 @@ static void net_on_status(VirtIODevice *vdev, uint32_t status) {
 
     if (status == 0) {
         net->rx_ready = 0;
+        net->rx_poll = 0;
+        net_update_interest(net);
     }
 }
 

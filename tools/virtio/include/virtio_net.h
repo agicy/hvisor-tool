@@ -49,6 +49,7 @@ typedef struct virtio_net_dev {
     NetConfig config;
     int tapfd;
     int rx_ready;
+    int rx_poll;
     struct hvisor_event *event;
     struct iovec *in_iov;
     struct iovec *out_iov;
