@@ -152,18 +152,25 @@ static void virtio_net_event_handler(int fd, int epoll_type, void *param) {
         }
 
         // RX: all buffers are VRING_DESC_F_WRITE → in_iov
-        // IFF_VNET_HDR: TAP writes [virtio_net_hdr | packet] directly
-        len = readv(net->tapfd, req.in_iov, req.in_count);
+        // IFF_VNET_HDR: TAP writes [virtio_net_hdr | packet] directly.
+        //
+        // Read each frame into a private bounce buffer first, then deliver
+        // it only if it fits the guest chain entirely.  Never readv straight
+        // into the guest iovs: frames merged by GRO on the upstream NIC can
+        // exceed a ~2KB virtio buffer, and a truncated frame (short IP
+        // datagram) is dropped by the guest stack - silent per-frame loss
+        // that collapses TCP.  Oversized frames are dropped whole instead.
+        static uint8_t frame_buf[65536 + 128];
+        len = read(net->tapfd, frame_buf, sizeof(frame_buf));
 
         if (len < 0 && errno == EWOULDBLOCK) {
             // No more packets from tapfd, restore last_avail_idx.
-            log_info("no more packets");
             vq->last_avail_idx--;
             break;
         }
 
         if (len < 0) {
-            log_error("readv from tap failed, errno %d", errno);
+            log_error("read from tap failed, errno %d", errno);
             batch_indices[batch_count] = idx;
             batch_lens[batch_count] = 0;
             batch_count++;
@@ -177,6 +184,35 @@ static void virtio_net_event_handler(int fd, int epoll_type, void *param) {
             batch_count++;
             net->rx_ready = 0;
             break;
+        }
+
+        size_t cap = 0;
+        for (int k = 0; k < req.in_count; k++)
+            cap += req.in_iov[k].iov_len;
+        if ((size_t)len > cap) {
+            /* GRO/GSO superframe that no single virtio RX chain can hold:
+             * drop whole.  Log the first few so the frame size mix on the
+             * link is visible without flooding. */
+            static uint32_t drop_cnt, log_cnt;
+            drop_cnt++;
+            if (log_cnt < 16 && drop_cnt <= (log_cnt + 1) * 16) {
+                log_cnt++;
+                log_info("drop oversized frame: %d bytes > chain cap %zu "
+                         "(cumulative %u)", (int)len, cap, drop_cnt);
+            }
+            batch_indices[batch_count] = idx;
+            batch_lens[batch_count] = 0;
+            batch_count++;
+            continue;
+        }
+
+        size_t off = 0;
+        for (int k = 0; k < req.in_count && off < (size_t)len; k++) {
+            size_t chunk = req.in_iov[k].iov_len;
+            if (chunk > (size_t)len - off)
+                chunk = (size_t)len - off;
+            memcpy(req.in_iov[k].iov_base, frame_buf + off, chunk);
+            off += chunk;
         }
 
         batch_indices[batch_count] = idx;
