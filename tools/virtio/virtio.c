@@ -963,10 +963,17 @@ uint64_t virtio_mmio_read(VirtIODevice *vdev, uint64_t offset, unsigned size) {
 }
 
 /* Real IRQ assert: push one res entry and ask the hypervisor to inject.
- * Caller must hold vdev->interrupt_lock. */
+ * Caller must hold vdev->interrupt_lock.
+ *
+ * Invariant: every asserted IRQ must carry a pending interrupt_status bit.
+ * The Linux virtio-mmio ISR reads InterruptStatus and returns IRQ_NONE
+ * WITHOUT writing InterruptACK when it is 0; an assert without a status
+ * bit would therefore never be ACKed and the line would stay asserted
+ * forever, silently killing the device. */
 static void virtio_irq_assert_locked(VirtIODevice *vdev, VirtQueue *vq) {
     volatile struct device_res *res;
 
+    vdev->regs.interrupt_status |= VIRTIO_MMIO_INT_VRING;
     pthread_mutex_lock(&RES_MUTEX);
     while (is_queue_full(virtio_bridge->res_front, virtio_bridge->res_rear,
                          MAX_REQ)) {
