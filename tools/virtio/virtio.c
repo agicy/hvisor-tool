@@ -1119,23 +1119,8 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
         }
         if (deassert_ret == 0) {
             regs->interrupt_status = status_after;
-            if (status_after == 0) {
+            if (status_after == 0)
                 vdev->interrupt_line_asserted = false;
-                /* Used entries may have been committed while the line was
-                 * busy and the guest's ISR already read the used ring (see
-                 * virtio_inject_irq).  Re-assert once so the guest wakes and
-                 * re-reads the ring; a single IRQ covers every pending queue
-                 * because the ISR re-reads the whole used ring. */
-                bool had_pending = false;
-                for (uint32_t qi = 0; qi < vdev->vqs_len; qi++) {
-                    if (vdev->vqs[qi].notify_pending) {
-                        vdev->vqs[qi].notify_pending = false;
-                        had_pending = true;
-                    }
-                }
-                if (had_pending)
-                    virtio_irq_assert_locked(vdev, NULL);
-            }
         } else {
             status_after = status_before;
         }
@@ -1241,27 +1226,19 @@ void virtio_inject_irq(VirtQueue *vq) {
     VirtIODevice *vdev = vq->dev;
     pthread_mutex_lock(&vdev->interrupt_lock);
     vdev->regs.interrupt_status |= VIRTIO_MMIO_INT_VRING;
-    if (vdev->interrupt_line_asserted) {
-        /* An IRQ is already in flight and the guest has not ACKed it yet.
-         * Its ISR may have read the used ring before these entries were
-         * committed, so dropping the notification would lose the wakeup
-         * (the guest naps while entries sit in the ring, and nothing new
-         * will ever arrive to re-trigger an inject).  Record the pending
-         * notification; the ACK handler re-asserts once the line is free. */
-        vq->notify_pending = true;
-        uint64_t trace_seq = atomic_fetch_add_explicit(&virtio_irq_trace_seq, 1,
-                                                       memory_order_relaxed);
-        if (virtio_trace_sample(trace_seq)) {
-            log_info("[VDBG:assert-defer] seq=%llu zone=%u dev=%s irq=%u "
-                     "status=%#x",
-                     (unsigned long long)trace_seq, vdev->zone_id,
-                     virtio_device_type_to_string(vdev->type), vdev->irq_id,
-                     vdev->regs.interrupt_status);
-        }
-        pthread_mutex_unlock(&vdev->interrupt_lock);
-        return;
-    }
-    vq->notify_pending = false;
+    /* Always assert, even when the line is already marked asserted.
+     *
+     * The hypervisor dedups per-CPU in-flight SGIs, so a second FINISH_REQ
+     * while an SGI is still pending is a no-op there - and the pending SGI,
+     * when processed, makes the guest ISR read the *current* used ring,
+     * which already contains these entries.  The dangerous case was the
+     * opposite one: line busy in the daemon while the hypervisor list was
+     * already empty (guest ISR mid-flight).  Skipping the ioctl then lost
+     * the only wakeup for entries committed after the ISR read the ring.
+     * Injecting unconditionally closes that window: if the guest ISR has
+     * not read the ring yet, the pending SGI covers the entries; if it
+     * already has, a fresh SGI delivers a second IRQ and the ISR re-reads
+     * the ring. */
     virtio_irq_assert_locked(vdev, vq);
     pthread_mutex_unlock(&vdev->interrupt_lock);
 }
