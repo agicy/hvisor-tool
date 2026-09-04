@@ -1458,6 +1458,46 @@ static int consume_pending_requests(void) {
  *
  * @note The function runs indefinitely until a termination signal is received
  */
+/* Diagnostics: dump per-device state every 500ms so a stall (RX ring full
+ * and unserved vs. interrupt line stuck vs. RX unarmed with no re-kick)
+ * is identifiable from the log.  Read-only, no locks on device internals. */
+static void *virtio_watchdog_loop(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+
+        pthread_mutex_lock(&VDEV_MUTEX);
+        for (int i = 0; i < vdevs_num; ++i) {
+            VirtIODevice *v = vdevs[i];
+            if (!v || !v->dev)
+                continue;
+            if (v->type == VirtioTNet) {
+                NetDev *net = (NetDev *)v->dev;
+                VirtQueue *rq = &v->vqs[NET_QUEUE_RX];
+                VirtQueue *tq = &v->vqs[NET_QUEUE_TX];
+                log_info("[WD] net zone=%u irq=%u rx_poll=%d rx_ready=%d "
+                         "rx(avail=%u last_avail=%u used=%u last_used=%u) "
+                         "tx(avail=%u last_avail=%u) stat=%#x line=%d "
+                         "ack_age=%llums",
+                         v->zone_id, v->irq_id, net->rx_poll, net->rx_ready,
+                         (unsigned)(rq->avail_ring ? rq->avail_ring->idx : 0),
+                         (unsigned)rq->last_avail_idx,
+                         (unsigned)(rq->used_ring ? rq->used_ring->idx : 0),
+                         (unsigned)rq->last_used_idx,
+                         (unsigned)(tq->avail_ring ? tq->avail_ring->idx : 0),
+                         (unsigned)tq->last_avail_idx,
+                         v->regs.interrupt_status, v->interrupt_line_asserted,
+                         (unsigned long long)(now_ms - v->last_ack_ms));
+            }
+        }
+        pthread_mutex_unlock(&VDEV_MUTEX);
+        usleep(500 * 1000);
+    }
+    return NULL;
+}
+
 void handle_virtio_requests(void) {
     // Block signals to handle them synchronously via signalfd
     sigset_t mask;
@@ -1504,6 +1544,9 @@ void handle_virtio_requests(void) {
     }
 
     log_info("virtio request handler loop started.");
+    pthread_t wd_tid;
+    if (pthread_create(&wd_tid, NULL, virtio_watchdog_loop, NULL) != 0)
+        log_error("failed to start watchdog thread");
     int signal_count = 0, proc_count = 0;
     struct epoll_event events[16];
 

@@ -136,6 +136,8 @@ struct VirtIODevice {
     bool activated; // Whether the current virtio device is activated
     pthread_mutex_t interrupt_lock;
     bool interrupt_line_asserted;
+    uint64_t last_ack_ms;      /* monotonic ms of last guest IRQ ack */
+    uint64_t last_stuck_log_ms; /* monotonic ms of last stuck-line report */
 };
 
 struct virtio_device_ops {
