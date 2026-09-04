@@ -220,7 +220,21 @@ static int handle_clock_clock_attributes(SCMIDev *dev, uint16_t token,
         attributes |= (1U << 28);
 
     attr->attributes = attributes;
-    strncpy(attr->clock_name, args.u.clock_attr.clock_name, 15);
+    /* SCMI caps the clock name field at 16 bytes (15 + NUL). Zone0 CRU
+     * names such as "ref_clk_usb3otg2" / "suspend_clk_usb3otg2" are longer
+     * and, after naive truncation, collided with their OTG0 counterparts
+     * (both became "ref_clk_usb3otg" / "suspend_clk_usb"), making the guest
+     * fail clk registration with -EEXIST. Send a short unique alias keyed
+     * by the host clock id instead. Consumers look clocks up by index, so
+     * the name is only cosmetic. */
+    const char *full_name = args.u.clock_attr.clock_name;
+    if (strlen(full_name) > 15) {
+        char alias[16];
+        snprintf(alias, sizeof(alias), "clk%u", phys_id);
+        strncpy(attr->clock_name, alias, 15);
+    } else {
+        strncpy(attr->clock_name, full_name, 15);
+    }
     attr->clock_name[15] = '\0';
 
     return 0;
