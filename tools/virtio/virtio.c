@@ -85,8 +85,20 @@ static _Atomic uint64_t virtio_irq_trace_seq;
 
 static void stop_virtio_control_server(void);
 
+static uint64_t now_ms(void);
+
 static bool virtio_trace_sample(uint64_t seq) {
-    return seq < 128 || (seq != 0 && (seq & (seq - 1)) == 0);
+    (void)seq;
+    /* DIAG: time-gated (100ms) instead of power-of-2 sampling so the event
+     * sequence right before a stall is visible in the log. */
+    static _Atomic uint64_t last_log_ms;
+    uint64_t now = now_ms();
+    uint64_t last = atomic_load_explicit(&last_log_ms, memory_order_relaxed);
+    if (now - last >= 100) {
+        atomic_store_explicit(&last_log_ms, now, memory_order_relaxed);
+        return true;
+    }
+    return false;
 }
 
 static int virtio_deassert_line_locked(VirtIODevice *vdev) {
