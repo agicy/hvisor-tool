@@ -60,6 +60,17 @@ static int open_tap(const char *devname) {
         close(tunfd);
         return -1;
     }
+    /* The RX path drains the guest ring in bursts and parks overflow in
+     * this socket while the guest refills (rx_poll unarm/rearm cycles).
+     * The kernel default rcvbuf (~200KB, ~130 frames) overflows in the
+     * ~1ms refill gap at tens of MB/s and the bridge path drops frames
+     * silently - TCP sees loss bursts and stalls.  Give the tap enough
+     * elasticity to absorb the gap. */
+    int bufsz = 4 * 1024 * 1024;
+    if (setsockopt(tunfd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz)) < 0)
+        log_warn("setsockopt SO_RCVBUF failed, errno %d", errno);
+    if (setsockopt(tunfd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz)) < 0)
+        log_warn("setsockopt SO_SNDBUF failed, errno %d", errno);
     log_info("open virtio net tap succeed");
     return tunfd;
 }
