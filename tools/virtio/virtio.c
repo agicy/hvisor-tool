@@ -27,7 +27,6 @@
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -963,14 +962,6 @@ uint64_t virtio_mmio_read(VirtIODevice *vdev, uint64_t offset, unsigned size) {
     return 0;
 }
 
-static uint64_t now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-static long this_tid(void) { return (long)syscall(SYS_gettid); }
-
 /* Real IRQ assert: push one res entry and ask the hypervisor to inject.
  * Caller must hold vdev->interrupt_lock.
  *
@@ -984,16 +975,8 @@ static void virtio_irq_assert_locked(VirtIODevice *vdev, VirtQueue *vq) {
 
     vdev->regs.interrupt_status |= VIRTIO_MMIO_INT_VRING;
     pthread_mutex_lock(&RES_MUTEX);
-    uint64_t spin_start = now_ms();
     while (is_queue_full(virtio_bridge->res_front, virtio_bridge->res_rear,
                          MAX_REQ)) {
-        if (now_ms() - spin_start > 500) {
-            log_error("[DIAG] tid=%ld res queue FULL spinning >500ms "
-                      "zone=%u irq=%u front=%u rear=%u",
-                      this_tid(), vdev->zone_id, vdev->irq_id,
-                      virtio_bridge->res_front, virtio_bridge->res_rear);
-            spin_start = now_ms();
-        }
     }
     unsigned int res_rear = virtio_bridge->res_rear;
     res = &virtio_bridge->res_list[res_rear];
@@ -1004,16 +987,9 @@ static void virtio_irq_assert_locked(VirtIODevice *vdev, VirtQueue *vq) {
     write_barrier();
     pthread_mutex_unlock(&RES_MUTEX);
     int ret;
-    uint64_t ioctl_start = now_ms();
     do {
         ret = ioctl(ko_fd, HVISOR_FINISH_REQ);
     } while (ret < 0 && errno == EINTR);
-    if (now_ms() - ioctl_start > 500) {
-        log_error("[DIAG] tid=%ld FINISH_REQ ioctl took %llu ms zone=%u "
-                  "irq=%u",
-                  this_tid(), (unsigned long long)(now_ms() - ioctl_start),
-                  vdev->zone_id, vdev->irq_id);
-    }
     if (ret < 0) {
         log_error("assert failed: zone=%u irq=%u errno=%d (%s)",
                   vdev->zone_id, vdev->irq_id, errno, strerror(errno));
