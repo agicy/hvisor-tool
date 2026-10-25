@@ -347,10 +347,11 @@ create_virtio_device_unpublished(VirtioDeviceType dev_type, uint32_t zone_id,
     vdev->virtio_close = ops->close;
     vdev->status_changed = ops->status_changed;
 
-    // Allocate virtqueues before device init: net/console register their
-    // fds with the already-running event-monitor epoll inside ops->init,
-    // and the event handlers dereference vdev->vqs.  The pre-ops-table
-    // code also initialized queues first — keep that ordering.
+    // Allocate virtqueues before device init: ops->init starts per-device
+    // I/O machinery (blk/console worker threads) and registers fds with the
+    // already-running event-monitor epoll (net), all of which dereference
+    // vdev->vqs.  The pre-ops-table code also initialized queues first —
+    // keep that ordering.
     if (init_virtio_queue(vdev, ops) != 0)
         goto err;
 
@@ -1608,7 +1609,7 @@ int virtio_init() {
         goto unmap;
     }
 
-    // Initialize event_monitor used by console and net devices
+    // Initialize event_monitor used by net devices
     initialize_event_monitor();
     log_info("hvisor init okay!");
     return 0;
