@@ -100,6 +100,9 @@ struct VirtQueue {
                                // the frontend driver of the backend processing
                                // progress Enabling this feature will change the
                                // flags field of the avail_ring
+    bool notify_pending; // Used entries were committed while the interrupt
+                         // line was busy; the ACK handler re-asserts once
+                         // the guest clears the line (interrupt_lock)
     pthread_mutex_t used_ring_lock; // Used ring lock
 };
 
